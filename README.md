@@ -109,3 +109,4 @@ We want real, working software — not a prototype, not a toy. You'll likely foc
 To be clear: we expect the result to be better than what an AI would produce on its own with minimal guidance. Your judgment, taste, and direction are what make the difference.
 
 We're looking for intentional decisions — what you chose to build, what you cut, and why.
+# my-take-home
