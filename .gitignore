@@ -4,3 +4,25 @@ node_modules/
 __pycache__/
 .venv/
 .DS_Store
+
+# Python build artifacts
+dist/
+build/
+*.egg-info/
+*.pyc
+*.pyo
+
+# Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Type checker / linter caches
+.mypy_cache/
+.ruff_cache/
+
+# HuggingFace model cache (large, should be mounted as a volume)
+.hf_cache/
+
+# uv
+uv.lock

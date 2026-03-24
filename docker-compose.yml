@@ -1,0 +1,78 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  tts-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist HuggingFace model weights across restarts (~200 MB first download)
+      - hf-cache:/app/.hf_cache
+    environment:
+      TTS_BACKEND: kokoro
+      TTS_MAX_WORKERS: "4"
+      TTS_RATE_LIMIT_RPM: "120"
+      TTS_RATE_LIMIT_BURST: "20"
+      TTS_CACHE_MAX_SIZE: "2000"
+      TTS_QUEUE_ENABLED: "true"
+      TTS_CELERY_BROKER_URL: "redis://redis:6379/0"
+      TTS_CELERY_RESULT_BACKEND_URL: "redis://redis:6379/0"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s   # allow time for model download on first boot
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G        # Kokoro model + torch runtime
+        reservations:
+          memory: 1G
+
+  celery-worker:
+    build: .
+    command: >
+      uv run celery -A tts_api.workers.celery_app:celery_app worker
+      --loglevel=info --concurrency=2 --pool=prefork
+    volumes:
+      # Share model weights with tts-api — downloaded once, used by both
+      - hf-cache:/app/.hf_cache
+    environment:
+      TTS_BACKEND: kokoro
+      TTS_KOKORO_LANG_CODE: "a"
+      TTS_CELERY_BROKER_URL: "redis://redis:6379/0"
+      TTS_CELERY_RESULT_BACKEND_URL: "redis://redis:6379/0"
+      HF_HOME: /app/.hf_cache
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+
+volumes:
+  hf-cache:
+    driver: local
+  redis-data:
+    driver: local

@@ -1,0 +1,6 @@
+"""TTS service module — pluggable speech synthesis backends."""
+
+from tts_api.services.tts.base import DEFAULT_VOICES, TTSServiceBase
+from tts_api.services.tts.factory import create_tts_service
+
+__all__ = ["TTSServiceBase", "DEFAULT_VOICES", "create_tts_service"]

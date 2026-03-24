@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TTS API · Dev Console</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; }
+
+    /* animated waveform bars shown during streaming */
+    @keyframes wave {
+      0%, 100% { transform: scaleY(0.25); }
+      50%       { transform: scaleY(1); }
+    }
+    .wave-bar { animation: wave 0.9s ease-in-out infinite; transform-origin: bottom; }
+    .wave-bar:nth-child(1) { animation-delay: 0.00s; }
+    .wave-bar:nth-child(2) { animation-delay: 0.12s; }
+    .wave-bar:nth-child(3) { animation-delay: 0.24s; }
+    .wave-bar:nth-child(4) { animation-delay: 0.36s; }
+    .wave-bar:nth-child(5) { animation-delay: 0.48s; }
+
+    /* native audio element — tint scrollbar + outline */
+    audio { color-scheme: dark; }
+    audio::-webkit-media-controls-panel { background-color: #1e293b; }
+
+    /* custom scrollbar for log */
+    .log-scroll::-webkit-scrollbar       { width: 4px; }
+    .log-scroll::-webkit-scrollbar-track { background: transparent; }
+    .log-scroll::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+
+    textarea { field-sizing: content; min-height: 7rem; max-height: 20rem; }
+  </style>
+</head>
+
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+  <div class="max-w-2xl mx-auto px-4 py-8 space-y-4">
+
+    <!-- ── Header ───────────────────────────────────────────────────────── -->
+    <header class="flex items-start justify-between">
+      <div>
+        <h1 class="text-lg font-semibold tracking-tight">TTS API</h1>
+        <p class="text-xs text-slate-500 mt-0.5">Developer console</p>
+      </div>
+      <div class="flex items-center gap-2 pt-1">
+        <span id="health-dot" class="inline-block w-2 h-2 rounded-full bg-slate-700"></span>
+        <span id="health-text" class="text-xs text-slate-500">checking…</span>
+      </div>
+    </header>
+
+    <!-- ── Input card ────────────────────────────────────────────────────── -->
+    <section class="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-4">
+
+      <!-- text area -->
+      <div>
+        <div class="flex justify-between items-center mb-1.5">
+          <label class="text-xs text-slate-400 font-medium">Input text</label>
+          <span id="char-count" class="text-xs text-slate-600">0 chars</span>
+        </div>
+        <textarea
+          id="input-text"
+          class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/30 transition-colors resize-none"
+          placeholder="Enter text to synthesize…"
+        >Hello! This is the TTS API developer console. You can test synthesis, chunked streaming, and the WebSocket endpoint here. Streaming mode plays audio progressively as each sentence is synthesized — ideal for voice agent applications.</textarea>
+      </div>
+
+      <!-- controls row -->
+      <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <!-- voice -->
+        <div class="col-span-2 sm:col-span-1">
+          <label class="text-xs text-slate-400 block mb-1">Voice</label>
+          <select id="voice-select"
+            class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-sm focus:outline-none focus:border-indigo-500 transition-colors">
+            <option value="af_heart">Loading…</option>
+          </select>
+        </div>
+        <!-- speed -->
+        <div class="col-span-2 sm:col-span-1">
+          <label class="text-xs text-slate-400 block mb-1">
+            Speed&nbsp;<span id="speed-label" class="text-slate-200 tabular-nums">1.0×</span>
+          </label>
+          <input type="range" id="speed-range" min="0.5" max="2.0" step="0.1" value="1.0"
+            class="w-full h-2 accent-indigo-500 cursor-pointer mt-1.5" />
+        </div>
+        <!-- api key -->
+        <div class="col-span-2">
+          <label class="text-xs text-slate-400 block mb-1">
+            API key&thinsp;<span class="text-slate-600">(leave blank if auth disabled)</span>
+          </label>
+          <div class="relative">
+            <input type="password" id="api-key" placeholder="sk-…"
+              class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-3 pr-9 py-2 text-sm focus:outline-none focus:border-indigo-500 transition-colors" />
+            <button onclick="toggleKeyVisibility()"
+              class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 text-xs select-none px-1">
+              👁
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- action buttons -->
+      <div class="flex gap-2 pt-1">
+        <button id="btn-generate" onclick="run('generate')"
+          class="flex-1 bg-slate-700 hover:bg-slate-600 active:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed text-slate-100 rounded-lg py-2 text-sm font-medium transition-colors"
+          title="Blocks until full audio is ready. Auto-upgrades to streaming for long text.">
+          ▶ Generate
+        </button>
+        <button id="btn-stream" onclick="run('stream')"
+          class="flex-1 bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg py-2 text-sm font-medium transition-colors"
+          title="Plays audio progressively as each sentence is synthesized.">
+          ≋ Stream
+        </button>
+        <button id="btn-ws" onclick="run('websocket')"
+          class="flex-1 bg-slate-700 hover:bg-slate-600 active:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed text-slate-100 rounded-lg py-2 text-sm font-medium transition-colors"
+          title="For when text itself arrives incrementally — simulates an LLM sending tokens in real time.">
+          ⚡ WebSocket
+        </button>
+      </div>
+
+      <!-- smart mode hint — updates based on text length -->
+      <div id="mode-hint" class="text-xs text-slate-600 -mt-1 space-y-0.5">
+        <p id="hint-default">
+          <b class="text-slate-500">Stream</b> is recommended for most use cases — plays audio as each sentence
+          is synthesized. &nbsp;<b class="text-slate-500">Generate</b> auto-upgrades to streaming for long
+          text. &nbsp;<b class="text-slate-500">WebSocket</b> is for when text arrives incrementally (e.g. LLM output).
+        </p>
+        <p id="hint-long" class="hidden text-amber-600/80">
+          ⚠ Long text detected — <b>Generate</b> will auto-stream on the server side.
+          Use <b>Stream</b> or <b>WebSocket</b> for best results.
+        </p>
+      </div>
+    </section>
+
+    <!-- ── Output card ────────────────────────────────────────────────────── -->
+    <section id="output-card" class="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3 hidden">
+
+      <!-- error banner -->
+      <div id="error-banner" class="hidden bg-red-950/60 border border-red-800/60 rounded-lg px-3 py-2.5">
+        <p class="text-sm text-red-300" id="error-msg">Error</p>
+        <p class="text-xs text-red-500 mt-0.5" id="error-hint"></p>
+      </div>
+
+      <!-- native audio player (generate mode) -->
+      <audio id="audio-player" controls
+        class="hidden w-full rounded-lg [&::-webkit-media-controls-panel]:bg-slate-800"
+        style="height:40px;"></audio>
+
+      <!-- streaming status / waveform (stream + websocket modes) -->
+      <div id="stream-status" class="hidden flex items-center gap-3 py-1">
+        <div class="flex items-end gap-0.5 h-5 shrink-0">
+          <div class="wave-bar w-1.5 h-5 bg-indigo-500 rounded-sm"></div>
+          <div class="wave-bar w-1.5 h-4 bg-indigo-400 rounded-sm"></div>
+          <div class="wave-bar w-1.5 h-5 bg-indigo-500 rounded-sm"></div>
+          <div class="wave-bar w-1.5 h-3 bg-indigo-400 rounded-sm"></div>
+          <div class="wave-bar w-1.5 h-5 bg-indigo-500 rounded-sm"></div>
+        </div>
+        <span id="stream-label" class="text-sm text-slate-300">Streaming…</span>
+        <button onclick="stopStreaming()"
+          class="ml-auto text-xs text-slate-500 hover:text-slate-300 border border-slate-700 rounded px-2 py-0.5 transition-colors">
+          Stop
+        </button>
+      </div>
+
+      <!-- stats row -->
+      <div id="stats-row" class="hidden border-t border-slate-800 pt-3">
+        <div class="flex flex-wrap gap-x-6 gap-y-1 text-xs">
+          <span class="text-slate-500">Mode <span id="s-mode" class="text-slate-300 ml-1">—</span></span>
+          <span class="text-slate-500">Total&nbsp;time <span id="s-total" class="text-slate-300 ml-1">—</span></span>
+          <span class="text-slate-500">First&nbsp;audio <span id="s-ttfa" class="text-slate-300 ml-1">—</span></span>
+          <span class="text-slate-500">Size <span id="s-bytes" class="text-slate-300 ml-1">—</span></span>
+        </div>
+      </div>
+
+      <!-- websocket log -->
+      <div id="ws-panel" class="hidden space-y-2">
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-slate-500 font-medium">WebSocket log</span>
+          <button onclick="clearLog()" class="text-xs text-slate-600 hover:text-slate-400">clear</button>
+        </div>
+        <div id="ws-log"
+          class="log-scroll bg-slate-950 rounded-lg p-2.5 text-xs font-mono text-slate-400 max-h-48 overflow-y-auto space-y-0.5">
+        </div>
+      </div>
+    </section>
+
+  </div><!-- /max-w -->
+
+  <!-- ── JavaScript ──────────────────────────────────────────────────────── -->
+  <script>
+  'use strict';
+
+  // ── State ────────────────────────────────────────────────────────────────
+  let _activeWS = null;
+  let _stopRequested = false;
+  let _player = null;
+
+  // Must match TTS_AUTO_STREAM_THRESHOLD in config (default 300).
+  // Below this: Generate blocks and returns a full file.
+  // At or above: Generate auto-upgrades to streaming on the server.
+  const AUTO_STREAM_THRESHOLD = 300;
+
+  // ── Streaming audio player (Web Audio API) ───────────────────────────────
+  class StreamingPlayer {
+    constructor(sampleRate = 24000) {
+      this._sr   = sampleRate;
+      this._ctx  = null;
+      this._next = 0;         // scheduled end-time of the last chunk
+    }
+
+    async start() {
+      if (this._ctx) this._ctx.close().catch(() => {});
+      this._ctx  = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: this._sr });
+      this._next = this._ctx.currentTime + 0.08; // 80 ms initial buffer
+      await this._ctx.resume();
+      return this;
+    }
+
+    // Push a raw Int16 PCM Uint8Array chunk
+    push(uint8) {
+      const ctx = this._ctx;
+      if (!ctx) return;
+
+      const samples = uint8.byteLength >>> 1;
+      if (samples === 0) return;
+
+      const buf = ctx.createBuffer(1, samples, this._sr);
+      const ch  = buf.getChannelData(0);
+      const dv  = new DataView(uint8.buffer, uint8.byteOffset, uint8.byteLength);
+      for (let i = 0; i < samples; i++) ch[i] = dv.getInt16(i * 2, /* le= */ true) / 32768.0;
+
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+
+      const t = Math.max(ctx.currentTime, this._next);
+      src.start(t);
+      this._next = t + buf.duration;
+    }
+
+    stop() {
+      if (this._ctx) { this._ctx.close().catch(() => {}); this._ctx = null; }
+      this._next = 0;
+    }
+  }
+
+  // ── DOM helpers ──────────────────────────────────────────────────────────
+  const $  = id => document.getElementById(id);
+  const el = id => $(id);
+
+  function setButtons(loading) {
+    ['btn-generate','btn-stream','btn-ws'].forEach(id => el(id).disabled = loading);
+  }
+
+  function showOutput() { el('output-card').classList.remove('hidden'); }
+
+  function showError(msg, hint = '') {
+    showOutput();
+    el('error-banner').classList.remove('hidden');
+    el('error-msg').textContent  = msg;
+    el('error-hint').textContent = hint;
+  }
+
+  function hideError() { el('error-banner').classList.add('hidden'); }
+
+  function showAudio(url) {
+    hideError();
+    const a = el('audio-player');
+    a.src = url;
+    a.classList.remove('hidden');
+    a.load();
+    a.play().catch(() => {});
+  }
+
+  function showStreamStatus(text) {
+    showOutput();
+    hideError();
+    el('audio-player').classList.add('hidden');
+    el('stream-status').classList.remove('hidden');
+    el('stream-label').textContent = text || 'Streaming…';
+    el('ws-panel').classList.add('hidden');
+  }
+
+  function hideStreamStatus() { el('stream-status').classList.add('hidden'); }
+
+  function showStats({ mode, totalMs, ttfaMs, bytes }) {
+    el('stats-row').classList.remove('hidden');
+    el('s-mode').textContent  = mode;
+    el('s-total').textContent = totalMs != null ? totalMs + ' ms' : '—';
+    el('s-ttfa').textContent  = ttfaMs  != null ? ttfaMs  + ' ms' : '—';
+    el('s-bytes').textContent = bytes   != null ? fmtBytes(bytes) : '—';
+  }
+
+  function fmtBytes(n) {
+    return n < 1024 ? n + ' B' : n < 1048576 ? (n/1024).toFixed(1) + ' KB' : (n/1048576).toFixed(2) + ' MB';
+  }
+
+  // ── Smart mode recommendation ─────────────────────────────────────────────
+  const _BTN_PRIMARY   = 'bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white';
+  const _BTN_SECONDARY = 'bg-slate-700 hover:bg-slate-600 active:bg-slate-800 text-slate-100';
+
+  function _setButtonStyle(id, primary) {
+    const btn = el(id);
+    // Remove both style sets first
+    [_BTN_PRIMARY, _BTN_SECONDARY].flatMap(s => s.split(' ')).forEach(c => btn.classList.remove(c));
+    (_BTN_PRIMARY + ' ' + _BTN_SECONDARY).split(' ')  // reset
+      .filter(c => c)
+      .forEach(c => btn.classList.remove(c));
+    (_setButtonStyle._cls = _setButtonStyle._cls || {});
+    (primary ? _BTN_PRIMARY : _BTN_SECONDARY).split(' ').forEach(c => btn.classList.add(c));
+  }
+
+  function updateModeHint(len) {
+    const isLong = len >= AUTO_STREAM_THRESHOLD;
+    el('hint-default').classList.toggle('hidden', isLong);
+    el('hint-long').classList.toggle('hidden', !isLong);
+
+    // Highlight the recommended button
+    if (isLong) {
+      _setButtonStyle('btn-stream',   true);   // Stream = recommended
+      _setButtonStyle('btn-generate', false);
+    } else {
+      _setButtonStyle('btn-generate', false);  // both secondary for short text
+      _setButtonStyle('btn-stream',   true);   // Stream still default-highlighted
+    }
+  }
+
+  // websocket log
+  function logWS(text, cls = 'text-slate-400') {
+    const panel = el('ws-log');
+    const line  = document.createElement('div');
+    line.className = cls;
+    line.textContent = new Date().toTimeString().slice(0,8) + '  ' + text;
+    panel.appendChild(line);
+    panel.scrollTop = panel.scrollHeight;
+  }
+  function clearLog() { el('ws-log').innerHTML = ''; }
+
+  // ── Auth headers ──────────────────────────────────────────────────────────
+  function authHeaders() {
+    const key = el('api-key').value.trim();
+    return key ? { 'Authorization': 'Bearer ' + key } : {};
+  }
+
+  function toggleKeyVisibility() {
+    const inp = el('api-key');
+    inp.type = inp.type === 'password' ? 'text' : 'password';
+  }
+
+  // ── Stopstreaming ─────────────────────────────────────────────────────────
+  function stopStreaming() {
+    _stopRequested = true;
+    if (_player) { _player.stop(); _player = null; }
+    if (_activeWS) { _activeWS.close(); _activeWS = null; }
+    hideStreamStatus();
+  }
+
+  // ── Initialisation ────────────────────────────────────────────────────────
+  async function init() {
+    // update char counter + smart mode hint
+    const ta = el('input-text');
+    const cc = el('char-count');
+    const updateCount = () => {
+      const len = ta.value.length;
+      cc.textContent = len.toLocaleString() + ' chars';
+      updateModeHint(len);
+    };
+    ta.addEventListener('input', updateCount);
+    updateCount();
+
+    // speed slider
+    el('speed-range').addEventListener('input', e => {
+      el('speed-label').textContent = parseFloat(e.target.value).toFixed(1) + '×';
+    });
+
+    // health check
+    try {
+      const r = await fetch('/v1/health');
+      const d = await r.json();
+      el('health-dot').className = 'inline-block w-2 h-2 rounded-full ' +
+        (d.status === 'healthy' ? 'bg-emerald-500' : 'bg-amber-400');
+      el('health-text').textContent = d.status === 'healthy'
+        ? 'healthy · ' + d.backend
+        : 'degraded · model loading…';
+    } catch {
+      el('health-dot').className = 'inline-block w-2 h-2 rounded-full bg-red-500';
+      el('health-text').textContent = 'unreachable';
+    }
+
+    // load voices
+    try {
+      const r = await fetch('/v1/voices', { headers: authHeaders() });
+      if (r.ok) {
+        const { voices } = await r.json();
+        const sel = el('voice-select');
+        sel.innerHTML = voices.map(v =>
+          `<option value="${v.id}">${v.id} · ${v.gender}, ${v.language}</option>`
+        ).join('');
+      }
+    } catch { /* use placeholder */ }
+  }
+
+  // ── Generate (blocking REST) ──────────────────────────────────────────────
+  async function runGenerate() {
+    const t0 = Date.now();
+    showOutput();
+    hideError();
+    el('stream-status').classList.add('hidden');
+    el('ws-panel').classList.add('hidden');
+    el('audio-player').classList.add('hidden');
+    el('stats-row').classList.add('hidden');
+
+    const body = {
+      input:           el('input-text').value,
+      voice:           el('voice-select').value,
+      speed:           parseFloat(el('speed-range').value),
+      response_format: 'wav',
+      stream:          false,
+    };
+
+    const r = await fetch('/v1/audio/speech', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify(body),
+    });
+
+    if (!r.ok) { await handleHTTPError(r); return; }
+
+    const autoStreamed = r.headers.get('x-auto-streamed') === 'true';
+    const blob  = await r.blob();
+    const url   = URL.createObjectURL(blob);
+    const total = Date.now() - t0;
+
+    // If the server auto-upgraded to streaming the response body is PCM, not WAV.
+    // Use Web Audio to play it rather than the native <audio> element.
+    if (autoStreamed) {
+      hideStreamStatus();
+      const arrayBuf = await blob.arrayBuffer();
+      const p = new StreamingPlayer(24000);
+      await p.start();
+      p.push(new Uint8Array(arrayBuf));
+      showOutput();
+      const badge = document.createElement('div');
+      badge.className = 'text-sm text-amber-400 done-badge';
+      badge.textContent = '✓ Played (auto-streamed by server)';
+      el('output-card').querySelector('.done-badge')?.remove();
+      el('output-card').insertBefore(badge, el('stats-row'));
+      showStats({ mode: 'REST → auto-streamed', totalMs: total, ttfaMs: null, bytes: blob.size });
+    } else {
+      showAudio(url);
+      showStats({ mode: 'REST (blocking)', totalMs: total, ttfaMs: total, bytes: blob.size });
+    }
+  }
+
+  // ── Stream (progressive PCM) ──────────────────────────────────────────────
+  async function runStream() {
+    _stopRequested = false;
+    const t0 = Date.now();
+    let ttfa = null, totalBytes = 0;
+
+    showStreamStatus('Connecting…');
+    el('stats-row').classList.add('hidden');
+    el('ws-panel').classList.add('hidden');
+
+    const body = {
+      input:           el('input-text').value,
+      voice:           el('voice-select').value,
+      speed:           parseFloat(el('speed-range').value),
+      response_format: 'pcm',
+      stream:          true,
+    };
+
+    const r = await fetch('/v1/audio/speech', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify(body),
+    });
+
+    if (!r.ok) { await handleHTTPError(r); hideStreamStatus(); return; }
+
+    const sampleRate = parseInt(r.headers.get('x-sample-rate') || '24000');
+    _player = new StreamingPlayer(sampleRate);
+    await _player.start();
+
+    el('stream-label').textContent = 'Streaming audio…';
+
+    const reader = r.body.getReader();
+    let leftover = new Uint8Array(0);
+
+    try {
+      while (!_stopRequested) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        // Prepend any leftover odd byte from previous chunk
+        let chunk;
+        if (leftover.length > 0) {
+          chunk = new Uint8Array(leftover.length + value.length);
+          chunk.set(leftover);
+          chunk.set(value, leftover.length);
+        } else {
+          chunk = value;
+        }
+
+        // Keep even number of bytes (int16 = 2 bytes)
+        const even = chunk.length & ~1;
+        leftover = chunk.slice(even);      // 0 or 1 byte
+        if (even > 0) {
+          if (ttfa === null) { ttfa = Date.now() - t0; }
+          _player.push(chunk.slice(0, even));
+          totalBytes += even;
+          el('stream-label').textContent =
+            'Streaming… ' + fmtBytes(totalBytes) + ' received';
+        }
+      }
+    } finally {
+      reader.cancel().catch(() => {});
+    }
+
+    if (!_stopRequested) {
+      hideStreamStatus();
+      // Show a "done" indicator instead of audio element (audio is playing via WebAudio)
+      showOutput();
+      el('audio-player').classList.add('hidden');
+      const badge = document.createElement('div');
+      badge.className = 'text-sm text-emerald-400';
+      badge.textContent = '✓ Playback complete';
+      // replace any existing badge
+      el('output-card').querySelector('.done-badge')?.remove();
+      badge.classList.add('done-badge');
+      el('output-card').insertBefore(badge, el('stats-row'));
+      showStats({ mode: 'REST (streaming PCM)', totalMs: Date.now() - t0, ttfaMs: ttfa, bytes: totalBytes });
+    }
+    _player = null;
+  }
+
+  // ── WebSocket (simulates LLM word-by-word) ────────────────────────────────
+  async function runWebSocket() {
+    _stopRequested = false;
+    const t0 = Date.now();
+    let ttfa = null, totalBytes = 0;
+
+    showOutput();
+    hideError();
+    el('audio-player').classList.add('hidden');
+    el('stats-row').classList.add('hidden');
+    el('stream-status').classList.add('hidden');
+    el('ws-panel').classList.remove('hidden');
+    clearLog();
+    el('output-card').querySelector('.done-badge')?.remove();
+
+    const wsUrl = new URL('/v1/audio/speech/ws', window.location.href);
+    wsUrl.protocol = wsUrl.protocol.replace('http', 'ws');
+    const key = el('api-key').value.trim();
+    if (key) wsUrl.searchParams.set('api_key', key);
+
+    const ws = new WebSocket(wsUrl.toString());
+    _activeWS = ws;
+    ws.binaryType = 'arraybuffer';
+
+    _player = new StreamingPlayer(24000);
+    await _player.start();
+
+    const words = el('input-text').value.trim().split(/\s+/);
+    let wordIdx = 0, sendInterval = null;
+
+    ws.onopen = () => logWS('↑ connected', 'text-indigo-400');
+
+    ws.onmessage = async evt => {
+      if (evt.data instanceof ArrayBuffer) {
+        const chunk = new Uint8Array(evt.data);
+        if (ttfa === null) { ttfa = Date.now() - t0; }
+        _player.push(chunk);
+        totalBytes += chunk.byteLength;
+        logWS('← audio  ' + fmtBytes(chunk.byteLength), 'text-slate-500');
+      } else {
+        const msg = JSON.parse(evt.data);
+        if (msg.type === 'ready') {
+          logWS('← ready · ' + JSON.stringify({ sr: msg.sample_rate, ch: msg.channels }), 'text-emerald-600');
+          // set voice/speed from controls
+          ws.send(JSON.stringify({
+            type:  'config',
+            voice: el('voice-select').value,
+            speed: parseFloat(el('speed-range').value),
+          }));
+          logWS('→ config · voice=' + el('voice-select').value, 'text-indigo-400');
+          // start streaming words (simulating LLM output ~5 words/sec)
+          sendInterval = setInterval(() => {
+            if (_stopRequested || wordIdx >= words.length) {
+              clearInterval(sendInterval);
+              ws.send(JSON.stringify({ type: 'flush' }));
+              logWS('→ flush', 'text-indigo-400');
+              return;
+            }
+            const chunk = words[wordIdx++] + ' ';
+            ws.send(JSON.stringify({ type: 'text', text: chunk }));
+            logWS('→ text  "' + chunk.trimEnd() + '"', 'text-slate-500');
+          }, 200);
+        } else if (msg.type === 'done') {
+          logWS('← done  · total ' + fmtBytes(totalBytes), 'text-emerald-500');
+          showStats({ mode: 'WebSocket', totalMs: Date.now() - t0, ttfaMs: ttfa, bytes: totalBytes });
+          ws.close();
+        } else if (msg.type === 'error') {
+          logWS('← error: ' + msg.message, 'text-red-400');
+        }
+      }
+    };
+
+    ws.onerror = () => {
+      logWS('✕ connection error', 'text-red-400');
+      clearInterval(sendInterval);
+    };
+
+    ws.onclose = evt => {
+      if (evt.code === 4001) {
+        logWS('✕ closed: unauthorized (check API key)', 'text-red-400');
+        showError('WebSocket rejected: invalid or missing API key.', 'Pass ?api_key=<key> in the URL or enter your key above.');
+      } else {
+        logWS('↓ closed ' + evt.code, 'text-slate-600');
+      }
+      clearInterval(sendInterval);
+      if (_player) { _player = null; }
+      _activeWS = null;
+    };
+  }
+
+  // ── Main dispatcher ───────────────────────────────────────────────────────
+  async function run(mode) {
+    // Stop any active stream/WS before starting a new one
+    stopStreaming();
+    _stopRequested = false;
+    setButtons(true);
+    // Clear stale done badge
+    el('output-card').querySelector('.done-badge')?.remove();
+
+    try {
+      if      (mode === 'generate')  await runGenerate();
+      else if (mode === 'stream')    await runStream();
+      else if (mode === 'websocket') await runWebSocket();
+    } catch (err) {
+      showError('Unexpected error', err.message || String(err));
+    } finally {
+      setButtons(false);
+    }
+  }
+
+  // ── HTTP error handler ────────────────────────────────────────────────────
+  async function handleHTTPError(r) {
+    let body = {};
+    try { body = await r.json(); } catch { /* not JSON */ }
+    const detail = body.detail || body.message || body.error || r.statusText;
+
+    if (r.status === 401) {
+      showError('401 · Authentication required', 'Enter your API key above and try again.');
+    } else if (r.status === 403) {
+      showError('403 · Invalid API key', 'Double-check the key you entered.');
+    } else if (r.status === 429) {
+      showError('429 · Rate limit exceeded', 'Wait a moment and try again.');
+    } else {
+      showError(r.status + ' · ' + detail);
+    }
+  }
+
+  // ── Boot ──────────────────────────────────────────────────────────────────
+  document.addEventListener('DOMContentLoaded', init);
+  </script>
+</body>
+</html>
