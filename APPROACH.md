@@ -178,6 +178,8 @@ The mock backend (`TTS_BACKEND=mock`) returns silent numpy arrays instantly, ena
 
 **Multi-language** — Kokoro covers American and British English. Other languages would require a multilingual model (StyleTTS2, Coqui XTTS) or language-specific backend instances — straightforward with the pluggable backend pattern.
 
+**CI/CD pipeline** — No GitHub Actions workflows for running tests, linting, or deploying to a sandbox environment. In production I'd add: a CI job that runs `make lint` + `make test` on every PR, a build step that pushes the Docker image to a registry, and a CD step that deploys to a staging environment on merge to `main`. The Makefile targets and Dockerfile are already structured for this — the missing piece is the workflow YAML and a deployment target (e.g. Fly.io, Railway, or a K8s cluster).
+
 ---
 
 ## What Breaks First Under Pressure
