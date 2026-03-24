@@ -29,6 +29,7 @@ from tts_api.core.logging import configure_logging, get_logger
 from tts_api.middleware.metrics import MetricsMiddleware
 from tts_api.middleware.rate_limit import RateLimitMiddleware
 from tts_api.services.cache import AudioCache
+from tts_api.services.concurrency import AdaptiveConcurrencyLimiter
 from tts_api.services.tts.factory import create_tts_service
 
 logger = get_logger(__name__)
@@ -62,6 +63,17 @@ async def lifespan(app: FastAPI):
 
     app.state.tts_service = tts_service
     app.state.audio_cache = audio_cache
+
+    # ── Adaptive concurrency limiter ──────────────────────────────────────────
+    initial = settings.adaptive_concurrency_initial or settings.max_workers * 2
+    concurrency_limiter = AdaptiveConcurrencyLimiter(
+        initial=initial,
+        min_limit=1,
+        max_limit=settings.max_workers * 8,
+        target_latency_s=settings.adaptive_concurrency_target_latency_s,
+        enabled=settings.adaptive_concurrency_enabled,
+    )
+    app.state.concurrency_limiter = concurrency_limiter
 
     # ── Queue TTS service (HTTP requests when queue_enabled=True) ─────────────
     # WebSocket handler reads app.state.tts_service directly and is unaffected.

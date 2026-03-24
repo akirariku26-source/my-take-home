@@ -247,6 +247,30 @@ class TestMockTTSService:
         for chunk in chunks:
             assert chunk[:4] != b"RIFF"
 
+    async def test_streaming_cancel_stops_early(self, mock_svc):
+        """Setting the cancel event should stop the stream before all chunks are yielded."""
+        import threading
+
+        cancel = threading.Event()
+        cancel.set()  # pre-cancel before iteration starts
+        chunks = [
+            c async for c in mock_svc.synthesize_streaming("Hello", "af_heart", 1.0, cancel=cancel)
+        ]
+        # Should yield 0 chunks since cancel was already set
+        assert len(chunks) == 0
+
+    async def test_streaming_cancel_mid_stream(self, mock_svc):
+        """Cancel mid-stream yields fewer chunks than a full stream."""
+        import threading
+
+        cancel = threading.Event()
+        chunks = []
+        async for chunk in mock_svc.synthesize_streaming("Hello", "af_heart", 1.0, cancel=cancel):
+            chunks.append(chunk)
+            cancel.set()  # cancel after first chunk
+        # Should have at most 1 chunk (the one before cancel was checked)
+        assert len(chunks) < 3
+
     async def test_get_voices_returns_default_list(self, mock_svc):
         voices = await mock_svc.get_voices()
         assert voices == DEFAULT_VOICES
@@ -432,6 +456,39 @@ class TTSBackendConformance(ABC):
 
     async def test_shutdown_does_not_raise(self, service):
         await service.shutdown()
+
+    async def test_streaming_cancel_pre_set_yields_nothing(self, service):
+        """A pre-set cancel event should stop the stream immediately."""
+        import threading
+
+        cancel = threading.Event()
+        cancel.set()
+        chunks = [
+            c async for c in service.synthesize_streaming(
+                "Hello world.", "af_heart", 1.0, cancel=cancel
+            )
+        ]
+        assert len(chunks) == 0
+
+    async def test_streaming_cancel_mid_stream_stops_early(self, service):
+        """Setting cancel mid-stream should yield fewer chunks than a full stream."""
+        import threading
+
+        # First, count full (uncancelled) chunks
+        full_chunks = [
+            c async for c in service.synthesize_streaming("Hello.", "af_heart", 1.0)
+        ]
+
+        # Now cancel after first chunk
+        cancel = threading.Event()
+        partial_chunks = []
+        async for chunk in service.synthesize_streaming(
+            "Hello.", "af_heart", 1.0, cancel=cancel
+        ):
+            partial_chunks.append(chunk)
+            cancel.set()
+
+        assert len(partial_chunks) < len(full_chunks) or len(full_chunks) <= 1
 
 
 class TestMockConformance(TTSBackendConformance):

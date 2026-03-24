@@ -30,7 +30,7 @@ import numpy as np
 from tts_api.core.logging import get_logger
 from tts_api.services.audio import SAMPLE_RATE, audio_to_wav, float32_to_pcm16
 from tts_api.services.tts.base import TTSServiceBase
-from tts_api.services.tts.metrics import MODEL_LATENCY
+from tts_api.services.tts.metrics import MODEL_LATENCY, REAL_TIME_FACTOR
 
 logger = get_logger(__name__)
 
@@ -75,41 +75,66 @@ class KokoroTTSService(TTSServiceBase):
         audio = await loop.run_in_executor(self._executor, self._synth_sync, text, voice, speed)
         return audio_to_wav(audio, self.sample_rate)
 
-    async def synthesize_streaming(self, text: str, voice: str, speed: float):
+    async def synthesize_streaming(
+        self, text: str, voice: str, speed: float,
+        cancel: threading.Event | None = None,
+    ):
         """
         Async generator — yields PCM int16 byte chunks as Kokoro processes
         each sentence, enabling sub-sentence first-audio latency.
         """
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue(maxsize=_STREAM_QUEUE_SIZE)
+        _cancel = cancel or threading.Event()
 
         def _produce() -> None:
             try:
                 pipe = self._pipeline()
                 start = time.perf_counter()
+                total_pcm_bytes = 0
                 for _g, _p, audio in pipe(text, voice=voice, speed=speed):
+                    if _cancel.is_set():
+                        break
                     pcm = float32_to_pcm16(audio)
+                    total_pcm_bytes += len(pcm)
                     # Back-pressure: block the worker thread if the consumer
                     # (client) is too slow, preventing unbounded memory use.
                     future = asyncio.run_coroutine_threadsafe(queue.put(pcm), loop)
-                    future.result(timeout=60)
-                MODEL_LATENCY.labels(voice=voice, mode="streaming").observe(
-                    time.perf_counter() - start
-                )
+                    try:
+                        future.result(timeout=10)
+                    except Exception:
+                        break
+                elapsed = time.perf_counter() - start
+                if not _cancel.is_set():
+                    MODEL_LATENCY.labels(voice=voice, mode="streaming").observe(elapsed)
+                    if total_pcm_bytes > 0:
+                        audio_duration = total_pcm_bytes / (SAMPLE_RATE * 2)
+                        REAL_TIME_FACTOR.labels(voice=voice, mode="streaming").observe(
+                            elapsed / audio_duration
+                        )
             except Exception as exc:
-                asyncio.run_coroutine_threadsafe(queue.put(exc), loop).result(timeout=5)
+                if not _cancel.is_set():
+                    asyncio.run_coroutine_threadsafe(queue.put(exc), loop).result(timeout=5)
             finally:
-                asyncio.run_coroutine_threadsafe(queue.put(None), loop).result(timeout=5)
+                try:
+                    asyncio.run_coroutine_threadsafe(queue.put(None), loop).result(timeout=5)
+                except Exception:
+                    pass
 
         self._executor.submit(_produce)
 
-        while True:
-            item = await queue.get()
-            if item is None:
-                return
-            if isinstance(item, Exception):
-                raise item
-            yield item
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    return
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            # Consumer is done (client disconnect or normal end) — signal
+            # the producer thread to stop as soon as possible.
+            _cancel.set()
 
     async def get_voices(self) -> list[str]:
         from tts_api.services.tts.base import DEFAULT_VOICES

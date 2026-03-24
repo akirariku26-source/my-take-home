@@ -5,6 +5,8 @@ Used in tests and CI so we never hit the real model.
 Activated via TTS_BACKEND=mock.
 """
 
+import threading
+
 import numpy as np
 
 from tts_api.services.audio import SAMPLE_RATE, audio_to_wav, float32_to_pcm16
@@ -22,12 +24,17 @@ class MockTTSService(TTSServiceBase):
         audio = np.zeros(int(self.sample_rate * duration), dtype=np.float32)
         return audio_to_wav(audio, self.sample_rate)
 
-    async def synthesize_streaming(self, text: str, voice: str, speed: float):
+    async def synthesize_streaming(
+        self, text: str, voice: str, speed: float,
+        cancel: threading.Event | None = None,
+    ):
         # Yield 3 chunks of silence so streaming tests can validate chunk flow
         chunk_samples = int(self.sample_rate * _CHUNK_DURATION)
         audio = np.zeros(chunk_samples, dtype=np.float32)
         pcm = float32_to_pcm16(audio)
         for _ in range(3):
+            if cancel and cancel.is_set():
+                return
             yield pcm
 
     async def get_voices(self) -> list[str]:

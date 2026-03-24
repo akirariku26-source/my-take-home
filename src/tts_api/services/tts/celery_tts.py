@@ -20,6 +20,7 @@ Streaming path
 """
 
 import asyncio
+import threading
 from uuid import uuid4
 
 import redis.asyncio as aioredis
@@ -48,7 +49,10 @@ class CeleryTTSService(TTSServiceBase):
         )
         return bytes.fromhex(hex_wav)
 
-    async def synthesize_streaming(self, text: str, voice: str, speed: float):
+    async def synthesize_streaming(
+        self, text: str, voice: str, speed: float,
+        cancel: threading.Event | None = None,
+    ):
         """
         Submit a streaming synthesis task and yield PCM chunks via Redis
         Pub/Sub as the worker produces them sentence by sentence.

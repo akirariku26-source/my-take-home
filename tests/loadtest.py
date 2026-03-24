@@ -18,6 +18,11 @@ Usage
     --host https://tts.my-cluster.example.com \
     --csv results/k8s-run
 
+# Simulate a traffic burst (adaptive concurrency limiter test)
+  locust -f tests/loadtest.py --headless -u 100 -r 100 -t 30s \
+    --host http://localhost:8000 \
+    --class-picker BurstUser
+
 K8s capacity planning
 ─────────────────────
 The goal is to find the max sustained concurrency for one pod before:
@@ -40,10 +45,28 @@ Typical results (Kokoro-82M, CPU only, 4 workers, 4 vCPU):
   • Short text (< 50 chars):   ~15-25 RPS per pod, p99 ~ 0.5 s
   • Medium text (100-300 chars): ~5-10 RPS per pod, p99 ~ 2 s
   • Streaming first-chunk:       p99 ~ 0.3-0.5 s regardless of text length
+
+Adaptive concurrency limiter
+────────────────────────────
+BurstUser deliberately generates a spike of back-to-back requests with no
+wait time to trigger the AIMD window.  Once in_flight ≥ limit the server
+returns 503.  Watch the Prometheus metrics to see the limiter in action:
+
+  # current window and in-flight count
+  curl -s http://localhost:8000/metrics | grep tts_concurrency
+
+  Expected behaviour during a burst:
+    tts_concurrency_in_flight   rises to match the window
+    tts_concurrency_limit       shrinks multiplicatively as latency climbs
+    tts_concurrency_rejected_total  counts shed requests (503s)
+    tts_concurrency_ewma_latency_seconds  tracks the smoothed latency signal
+
+  A healthy recovery looks like:
+    503 rate drops as the burst subsides → EWMA latency falls below target →
+    window grows additively back toward its original size.
 """
 
 import random
-import string
 
 from locust import HttpUser, between, task
 
@@ -173,3 +196,57 @@ class TTSUser(HttpUser):
     @task(1)
     def health_check(self):
         self.client.get("/v1/health", name="/v1/health")
+
+
+class BurstUser(HttpUser):
+    """
+    Generates a sudden spike of back-to-back synthesis requests with no
+    wait time between them.  Use this to observe the adaptive concurrency
+    limiter in action:
+
+      • In-flight count climbs to the current window size
+      • Once the window is full, requests get 503 (counted as failures by Locust)
+      • EWMA latency rises → window shrinks multiplicatively
+      • As the burst subsides, window recovers additively
+
+    Run in isolation to get a clean signal:
+      locust -f tests/loadtest.py --headless -u 80 -r 80 -t 30s \\
+        --host http://localhost:8000 --class-picker BurstUser
+    """
+
+    wait_time = between(0, 0.05)  # near-zero think time — maximise concurrency
+
+    @task(8)
+    def burst_buffered(self):
+        """Dense buffered requests — the primary limiter stress test."""
+        resp = self.client.post(
+            "/v1/audio/speech",
+            json={
+                "input": random.choice(_MEDIUM_TEXTS),
+                "voice": random.choice(_VOICES),
+                "stream": False,
+            },
+            name="/v1/audio/speech [burst-buffered]",
+        )
+        # 503 = limiter shed the request (expected under overload, not a bug)
+        if resp.status_code == 503:
+            resp.success()  # don't count as Locust failure; track via Prometheus
+
+    @task(2)
+    def burst_streaming(self):
+        """Dense streaming requests — limiter holds the slot for stream duration."""
+        with self.client.post(
+            "/v1/audio/speech",
+            json={
+                "input": random.choice(_SHORT_TEXTS),
+                "voice": random.choice(_VOICES),
+                "stream": True,
+            },
+            name="/v1/audio/speech [burst-stream]",
+            stream=True,
+        ) as resp:
+            if resp.status_code == 503:
+                resp.success()
+                return
+            for _ in resp.iter_content(chunk_size=4096):
+                pass

@@ -19,6 +19,7 @@ os.environ.setdefault("TTS_RATE_LIMIT_ENABLED", "false")
 from tts_api.core.config import Settings, get_settings  # noqa: E402
 from tts_api.main import create_app  # noqa: E402
 from tts_api.services.cache import AudioCache  # noqa: E402
+from tts_api.services.concurrency import AdaptiveConcurrencyLimiter  # noqa: E402
 from tts_api.services.tts.factory import create_tts_service  # noqa: E402
 
 _VALID_KEY = "sk-test-valid-key"
@@ -34,6 +35,7 @@ def _make_app(api_keys: str = ""):
         app = create_app(settings)
         app.state.tts_service = create_tts_service(settings)
         app.state.audio_cache = AudioCache(max_size=100, enabled=True)
+        app.state.concurrency_limiter = AdaptiveConcurrencyLimiter(enabled=False)
         return app
     finally:
         # Restore clean state for other tests

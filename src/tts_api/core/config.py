@@ -51,6 +51,16 @@ class Settings(BaseSettings):
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend_url: str = "redis://localhost:6379/0"
 
+    # ── Adaptive concurrency control ──────────────────────────────────────────
+    # AIMD window that limits simultaneous in-flight synthesis requests.
+    # Shrinks when observed latency exceeds the target; grows when healthy.
+    # Excess requests receive an immediate 503 (fail-fast, not queue-and-wait).
+    adaptive_concurrency_enabled: bool = True
+    # Window size at startup.  0 = auto: max_workers * 2.
+    adaptive_concurrency_initial: int = 0
+    # Target EWMA latency (seconds).  Window shrinks when exceeded.
+    adaptive_concurrency_target_latency_s: float = 10.0
+
     # ── Audio cache ───────────────────────────────────────────────────────────
     # LRU cache keyed by (text, voice, speed).
     # Greatly reduces latency for repeated requests (e.g. common phrases).

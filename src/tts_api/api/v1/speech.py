@@ -9,6 +9,7 @@ WS   /v1/audio/speech/ws       – real-time streaming for voice agents
 """
 
 import json
+import threading
 import time
 
 from fastapi import (  # noqa: E501
@@ -100,6 +101,10 @@ def _settings(request: Request):
     return request.app.state.settings
 
 
+def _limiter(request: Request):
+    return request.app.state.concurrency_limiter
+
+
 # ── REST endpoints ────────────────────────────────────────────────────────────
 
 
@@ -128,6 +133,7 @@ async def create_speech(body: SpeechRequest, request: Request):
     tts = _tts(request)
     cache = _cache(request)
     settings = _settings(request)
+    limiter = _limiter(request)
 
     text = body.input.strip()
     voice = body.voice or settings.default_voice
@@ -153,11 +159,11 @@ async def create_speech(body: SpeechRequest, request: Request):
     )
     if body.stream or auto_streamed:
         extra = {"X-Auto-Streamed": "true"} if auto_streamed else {}
-        return _stream_response(text, voice, speed, body.response_format, tts, extra)
+        return _stream_response(text, voice, speed, body.response_format, tts, limiter, extra)
 
     # ── Non-streaming ─────────────────────────────────────────────────────────
     with _LATENCY.time():
-        # Cache lookup
+        # Cache lookup — hits bypass the concurrency window (no synthesis work)
         cached = await cache.get(text, voice, speed)
         if cached is not None:
             _CACHE_HITS.inc()
@@ -173,12 +179,14 @@ async def create_speech(body: SpeechRequest, request: Request):
 
         _CACHE_MISSES.inc()
 
-        try:
-            wav_bytes = await tts.synthesize(text, voice, speed)
-        except Exception as exc:
-            logger.error("synthesis_failed", voice=voice, error=str(exc))
-            _REQUESTS.labels(voice=voice, format=body.response_format.value, status="error").inc()
-            raise HTTPException(500, "TTS synthesis failed") from exc
+        # Acquire a concurrency slot — 503 if window is full
+        async with limiter.acquire():
+            try:
+                wav_bytes = await tts.synthesize(text, voice, speed)
+            except Exception as exc:
+                logger.error("synthesis_failed", voice=voice, error=str(exc))
+                _REQUESTS.labels(voice=voice, format=body.response_format.value, status="error").inc()
+                raise HTTPException(500, "TTS synthesis failed") from exc
 
         await cache.set(text, voice, speed, wav_bytes)
         _REQUESTS.labels(voice=voice, format=body.response_format.value, status="ok").inc()
@@ -204,35 +212,41 @@ def _stream_response(
     speed: float,
     fmt: AudioFormat,
     tts,
+    limiter,
     extra_headers: dict | None = None,
 ):
     """Build a StreamingResponse that sends audio as it's synthesized."""
 
     async def _generate():
-        if fmt == AudioFormat.wav:
-            # WAV header with unknown data size — players treat it as "play until EOF"
-            yield make_streaming_wav_header(tts.sample_rate)
+        # Acquire the concurrency slot BEFORE yielding any bytes.
+        # If the window is full, HTTPException(503) propagates cleanly here
+        # because no bytes have been sent yet — Starlette can still return a
+        # proper error response.  Once we start yielding, headers are committed.
+        async with limiter.acquire():
+            if fmt == AudioFormat.wav:
+                # WAV header with unknown data size — players treat it as "play until EOF"
+                yield make_streaming_wav_header(tts.sample_rate)
 
-        byte_count = 0
-        first_chunk = True
-        start = time.perf_counter()
-        try:
-            async for pcm_chunk in tts.synthesize_streaming(text, voice, speed):
-                if first_chunk:
-                    _STREAM_FIRST_CHUNK.labels(voice=voice).observe(
-                        time.perf_counter() - start
-                    )
-                    first_chunk = False
-                yield pcm_chunk
-                byte_count += len(pcm_chunk)
-        except Exception as exc:
-            logger.error("stream_error", voice=voice, error=str(exc))
-            raise
+            byte_count = 0
+            first_chunk = True
+            start = time.perf_counter()
+            try:
+                async for pcm_chunk in tts.synthesize_streaming(text, voice, speed):
+                    if first_chunk:
+                        _STREAM_FIRST_CHUNK.labels(voice=voice).observe(
+                            time.perf_counter() - start
+                        )
+                        first_chunk = False
+                    yield pcm_chunk
+                    byte_count += len(pcm_chunk)
+            except Exception as exc:
+                logger.error("stream_error", voice=voice, error=str(exc))
+                raise
 
-        _STREAM_DURATION.labels(voice=voice).observe(time.perf_counter() - start)
-        _BYTES_OUT.inc(byte_count)
-        _REQUESTS.labels(voice=voice, format=f"{fmt.value}-stream", status="ok").inc()
-        logger.info("stream_complete", voice=voice, bytes=byte_count)
+            _STREAM_DURATION.labels(voice=voice).observe(time.perf_counter() - start)
+            _BYTES_OUT.inc(byte_count)
+            _REQUESTS.labels(voice=voice, format=f"{fmt.value}-stream", status="ok").inc()
+            logger.info("stream_complete", voice=voice, bytes=byte_count)
 
     media_type = "audio/wav" if fmt == AudioFormat.wav else "audio/pcm"
     headers = {
@@ -352,6 +366,7 @@ async def websocket_speech(
     voice = settings.default_voice
     speed = settings.default_speed
     accumulator = SentenceAccumulator()
+    cancel = threading.Event()
 
     # Send session metadata so the client knows how to decode PCM frames
     await websocket.send_json(
@@ -365,7 +380,7 @@ async def websocket_speech(
     )
 
     async def _synthesize_and_send(text: str) -> None:
-        async for pcm_chunk in tts.synthesize_streaming(text, voice, speed):
+        async for pcm_chunk in tts.synthesize_streaming(text, voice, speed, cancel=cancel):
             await websocket.send_bytes(pcm_chunk)
 
     try:
@@ -416,14 +431,16 @@ async def websocket_speech(
                 )
 
     except WebSocketDisconnect:
-        pass
+        cancel.set()
     except Exception as exc:
+        cancel.set()
         logger.error("websocket_error", error=str(exc))
         try:
             await websocket.close(code=1011)
         except Exception:
             pass
     finally:
+        cancel.set()
         accumulator.reset()
         _WS_SESSION_DURATION.observe(time.perf_counter() - _ws_start)
         _ACTIVE_WS.dec()

@@ -67,9 +67,15 @@ For streaming, a worker thread pushes PCM chunks into an `asyncio.Queue(maxsize=
 
 ### Sentence accumulation for low-latency streaming
 
-The `SentenceAccumulator` class detects sentence boundaries (`.!?` + whitespace, or newlines) in the incremental text stream. TTS is dispatched per sentence rather than per token or per full turn. This cuts first-audio latency from "wait for full LLM response" to "wait for first sentence" — typically 1-2 seconds instead of 10-30 seconds for a full response.
+**Linguistic Context vs. Latency**
 
-**Tradeoff:** Sentence detection uses a simple regex, not an NLP model. Edge cases like "Dr. Smith" or "U.S.A." can produce premature splits. This is acceptable because a false split produces a brief pause, not a failure.
+I chose sentence-level buffering specifically to accommodate the Kokoro phonemizer’s dependency on local context.
+
+**The Challenge**: TTS models, including Kokoro, determine pitch, duration, and stress based on the surrounding tokens. Synthesizing single words or short fragments in a "naive" stream results in "robotic" or flat intonation because the model lacks the look-ahead context to identify terminal punctuation or phrase boundaries.
+
+**The Solution**: By using the SentenceAccumulator to hold tokens until a boundary (.!?) is reached, I ensure the model receives a complete semantic unit. This allows for natural prosodic contouring (e.g., rising pitch for questions) while maintaining a low Time-to-First-Audio (TTFA).
+
+**The Result**: We achieve the "Best of Both Worlds"—the low latency of a stream with the high-fidelity emotional cadence of a batch-processed file.
 
 ### Audio cache (LRU + TTL)
 
@@ -96,6 +102,42 @@ The queue adds ~50-100ms overhead per request — negligible for buffered synthe
 | Worker scaling | Tied to API server | Independent |
 | Crash recovery | Request lost | Task re-queued (`task_acks_late=True`) |
 | Latency | None | ~50-100 ms |
+
+### Adaptive concurrency control
+
+Even with a durable queue absorbing bursts, you still need a way to tell clients "slow down" before the server becomes overwhelmed. A durable queue can accept arbitrarily many tasks but that just moves the problem to unbounded queue depth and unbounded tail latency.
+
+The solution is an **AIMD concurrency window** — the same algorithm TCP uses for congestion control — applied at the synthesis layer:
+
+```
+after each completed request:
+  EWMA(latency) > target  →  limit *= 0.9    (multiplicative decrease — react fast)
+  EWMA(latency) < 0.8 × target  →  limit += 1    (additive increase — probe slowly)
+  otherwise  →  hold steady
+
+if in_flight ≥ limit:  return 503 immediately  (fail-fast, not queue-and-wait)
+```
+
+The window starts at `TTS_MAX_WORKERS × 2` (allows some queuing above the thread pool depth) and self-tunes from there. Requests that arrive when the window is full get an immediate 503 with `Retry-After: 1` so clients can back off and retry — they never queue silently and accumulate unbounded wait time.
+
+**Where it sits in the request path:**
+
+- **Cache hits** bypass the limiter entirely — they do no synthesis work.
+- **Buffered requests** acquire a slot after the cache miss, release it when synthesis completes (before response serialisation).
+- **Streaming requests** acquire the slot inside `_generate()` *before the first yield*, so a 503 is still a proper HTTP error. The slot is held for the full stream duration, accurately reflecting that a worker is busy.
+- **WebSocket** bypasses the limiter — voice agents are long-lived by design and latency-sensitive.
+
+**Tradeoff vs. pure queueing:** The limiter sacrifices some throughput (it rejects requests rather than queuing them) in exchange for predictable latency. Under extreme overload, a 503 with `Retry-After: 1` is a better experience than a 30-second response — especially for voice agents where stale audio is useless.
+
+**Configuration:**
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `TTS_ADAPTIVE_CONCURRENCY_ENABLED` | `true` | Toggle the limiter |
+| `TTS_ADAPTIVE_CONCURRENCY_INITIAL` | `0` (→ `max_workers × 2`) | Starting window size |
+| `TTS_ADAPTIVE_CONCURRENCY_TARGET_LATENCY_S` | `10.0` | EWMA latency target in seconds |
+
+**Prometheus metrics:** `tts_concurrency_limit` (current window), `tts_concurrency_in_flight` (active slots), `tts_concurrency_rejected_total` (requests shed), `tts_concurrency_ewma_latency_seconds` (smoothed latency driving the algorithm).
 
 ### Pluggable TTS backends
 
@@ -155,8 +197,11 @@ Metrics are recorded at two independent layers so every failure mode is visible 
 | `rate(http_requests_total[1m])` | RPS by endpoint and status |
 | `histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))` | P99 end-to-end latency |
 | `histogram_quantile(0.95, rate(tts_stream_first_chunk_seconds_bucket[5m]))` | P95 time-to-first-audio |
+| `histogram_quantile(0.5, rate(tts_real_time_factor_bucket[5m]))` | Median RTF — <1.0 means faster than real-time |
 | `rate(tts_cache_hits_total[5m]) / rate(tts_requests_total[5m])` | Cache hit ratio |
 | `tts_active_websocket_connections` | Live voice-agent sessions |
+
+A key production metric is **Real-Time Factor (RTF)** — `inference_time / audio_duration`. RTF < 1.0 means synthesis is faster than playback (good); RTF > 1.0 means the model can't keep up with real-time. This is recorded automatically as `tts_real_time_factor` for both buffered and streaming modes, labeled by voice. For streaming voice agents, RTF directly determines whether audio gaps occur between sentences.
 
 ### Testing strategy
 
@@ -180,6 +225,18 @@ The mock backend (`TTS_BACKEND=mock`) returns silent numpy arrays instantly, ena
 
 **CI/CD pipeline** — No GitHub Actions workflows for running tests, linting, or deploying to a sandbox environment. In production I'd add: a CI job that runs `make lint` + `make test` on every PR, a build step that pushes the Docker image to a registry, and a CD step that deploys to a staging environment on merge to `main`. The Makefile targets and Dockerfile are already structured for this — the missing piece is the workflow YAML and a deployment target (e.g. Fly.io, Railway, or a K8s cluster).
 
+**Model evaluation** — With only one backend (Kokoro) there's nothing to compare against today. When a second backend is introduced (or a model version is upgraded), a formal evaluation framework becomes critical. Metrics I'd evaluate on:
+
+| Metric | What it measures | How |
+|---|---|---|
+| **Performance** | Inference latency (p50/p95/p99), throughput (RPS), time-to-first-audio for streaming | Prometheus metrics + Locust load tests (already instrumented) |
+| **Audio quality** | Naturalness, intelligibility, prosody | UTMOS (automated MOS predictor), PESQ; human MOS ratings for major releases |
+| **Robustness** | Handling of edge cases — numbers, abbreviations, URLs, mixed-case, long inputs | Curated test corpus with known-good reference audio, regression-checked in CI |
+| **Speaker consistency** | Same voice sounds the same across requests and model versions | Speaker embedding cosine similarity (e.g. Resemblyzer) |
+| **Resource efficiency** | Memory footprint, CPU utilization per request, cost per audio-minute | `kubectl top` + Prometheus under controlled load |
+
+The pluggable backend pattern makes A/B evaluation straightforward — route a percentage of traffic to a candidate backend, collect metrics side-by-side, and promote or rollback based on quality + performance thresholds.
+
 ---
 
 ## What Breaks First Under Pressure
@@ -197,13 +254,25 @@ Under a burst, requests queue in the asyncio event loop (unbounded). Response ti
 
 ### Specific failure modes
 
-| What breaks | When | Impact | Fix |
-|---|---|---|---|
-| **Rate limiter** | >1 replica | Each replica has its own token bucket — N replicas = N× the allowed burst | Redis `INCR` + `EXPIRE` sliding window |
-| **Audio cache** | >1 replica or restart | No sharing, no persistence | Shared Redis cache |
-| **Thread pool** | >1 req/s sustained (4 workers) | Requests queue, latency grows linearly | Horizontal scaling (more replicas) |
-| **Disconnect during stream** | Client drops mid-stream | Worker thread blocked on `queue.put()` for 60s, holding a slot hostage | Cancellation `threading.Event` |
-| **Memory under concurrent long-form** | Many simultaneous large requests | Each synthesis buffers full audio in RAM; 100 × 10MB = 1GB peak | Auto-stream threshold mitigates; hard concurrency limit would eliminate |
+| What breaks | When | Impact | Fix | Mitigation |
+|---|---|---|---|---|
+| **Rate limiter** | >1 replica | Each replica has its own token bucket — N replicas = N× the allowed burst | Redis `INCR` + `EXPIRE` sliding window | Acceptable at low replica count; monitor `http_requests_total{status_code="429"}` for drift |
+| **Audio cache** | >1 replica or restart | No sharing, no persistence | Shared Redis cache | Cache warm-up script for common phrases; cache misses only cost latency, not correctness |
+| **Thread pool** | >1 req/s sustained (4 workers) | Requests queue, latency grows linearly | Horizontal scaling (more replicas) | K8s HPA on CPU utilization (target 70%); Celery queue absorbs bursts durably |
+| **Memory under concurrent long-form** | Many simultaneous large requests | Each synthesis buffers full audio in RAM; 100 × 10MB = 1GB peak | Hard concurrency limit | Auto-stream threshold already limits buffered allocations; K8s memory limits + OOM protection |
+
+### Cancellation and interrupted streams
+
+A key concern for resource efficiency: when a WebSocket client disconnects mid-stream (e.g. user interrupts, network drop), the worker thread running TTS inference must stop promptly — otherwise it holds a thread pool slot for seconds synthesizing audio nobody will hear, starving waiting clients.
+
+This is handled via a `threading.Event` cancellation signal threaded through the entire streaming path:
+
+1. The WebSocket handler creates a `cancel` event and passes it to `synthesize_streaming(cancel=cancel)`
+2. The Kokoro producer thread checks `cancel.is_set()` **between each sentence** in the KPipeline loop
+3. On disconnect, the handler sets `cancel` in all exit paths (`WebSocketDisconnect`, exception, `finally`)
+4. The async generator's `finally` block also sets `cancel` as a safety net (handles HTTP streaming disconnects and GC)
+
+**Result:** On client disconnect, the worker thread stops after completing at most the *current sentence* (~0.3-0.5s) instead of the entire remaining text (potentially 10-30s). The thread is immediately available for the next waiting client. The `queue.put()` timeout was also reduced from 60s to 10s with graceful error handling, so even if the event loop is gone the thread unblocks quickly.
 
 ### Horizontal scaling
 

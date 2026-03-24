@@ -23,6 +23,7 @@ from httpx import ASGITransport, AsyncClient
 from tts_api.core.config import Settings, get_settings
 from tts_api.main import create_app
 from tts_api.services.cache import AudioCache
+from tts_api.services.concurrency import AdaptiveConcurrencyLimiter
 from tts_api.services.tts.factory import create_tts_service
 
 # Clear the lru_cache so settings re-read the env vars we just set
@@ -51,6 +52,10 @@ async def app(settings: Settings):
     )
     application.state.tts_service = tts
     application.state.audio_cache = cache
+    application.state.concurrency_limiter = AdaptiveConcurrencyLimiter(
+        initial=settings.max_workers * 2,
+        enabled=settings.adaptive_concurrency_enabled,
+    )
 
     yield application
 
