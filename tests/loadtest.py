@@ -182,10 +182,12 @@ class TTSUser(HttpUser):
             },
             name="/v1/audio/speech [stream]",
             stream=True,
+            catch_response=True,
         ) as resp:
             # Consume the stream so Locust measures full transfer time
-            for _ in resp.iter_content(chunk_size=4096):
-                pass
+            if resp.raw is not None:
+                for _ in resp.iter_content(chunk_size=4096):
+                    pass
 
     # ── Supporting endpoints ──────────────────────────────────────────────────
 
@@ -219,7 +221,7 @@ class BurstUser(HttpUser):
     @task(8)
     def burst_buffered(self):
         """Dense buffered requests — the primary limiter stress test."""
-        resp = self.client.post(
+        with self.client.post(
             "/v1/audio/speech",
             json={
                 "input": random.choice(_MEDIUM_TEXTS),
@@ -227,10 +229,11 @@ class BurstUser(HttpUser):
                 "stream": False,
             },
             name="/v1/audio/speech [burst-buffered]",
-        )
-        # 503 = limiter shed the request (expected under overload, not a bug)
-        if resp.status_code == 503:
-            resp.success()  # don't count as Locust failure; track via Prometheus
+            catch_response=True,
+        ) as resp:
+            # 503 = limiter shed the request (expected under overload, not a bug)
+            if resp.status_code == 503:
+                resp.success()  # don't count as Locust failure; track via Prometheus
 
     @task(2)
     def burst_streaming(self):
@@ -244,9 +247,11 @@ class BurstUser(HttpUser):
             },
             name="/v1/audio/speech [burst-stream]",
             stream=True,
+            catch_response=True,
         ) as resp:
             if resp.status_code == 503:
                 resp.success()
                 return
-            for _ in resp.iter_content(chunk_size=4096):
-                pass
+            if resp.raw is not None:
+                for _ in resp.iter_content(chunk_size=4096):
+                    pass

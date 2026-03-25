@@ -258,7 +258,7 @@ The mock backend (`TTS_BACKEND=mock`) returns silent numpy arrays instantly, ena
 **Model evaluation** — With only one backend (Kokoro) there's nothing to compare against today. When a second backend is introduced (or a model version is upgraded), a formal evaluation framework becomes critical. Metrics I'd evaluate on:
 
 | Metric | What it measures | How |
-|---|---|---|
+|---|---|---|m
 | **Performance** | Inference latency (p50/p95/p99), throughput (RPS), time-to-first-audio for streaming | Prometheus metrics + Locust load tests (already instrumented) |
 | **Audio quality** | Naturalness, intelligibility, prosody | UTMOS (automated MOS predictor), PESQ; human MOS ratings for major releases |
 | **Robustness** | Handling of edge cases — numbers, abbreviations, URLs, mixed-case, long inputs | Curated test corpus with known-good reference audio, regression-checked in CI |

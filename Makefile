@@ -48,8 +48,13 @@ test-fast: ## Run tests without coverage, stop on first failure
 	$(UV) run pytest --no-cov -x -q
 
 loadtest: ## Run Locust load test (50 users, 60s) against localhost:8000
+	@echo "Note: start the server with rate limiting off: TTS_RATE_LIMIT_ENABLED=false make run"
 	$(UV) run --with locust locust -f tests/loadtest.py \
 	  --headless -u 50 -r 5 -t 60s --host http://localhost:8000
+
+loadtest-server: ## Start dev server with rate limiting disabled (for load testing)
+	TTS_RATE_LIMIT_ENABLED=false $(UV) run uvicorn $(APP_MODULE) \
+	  --reload --host 0.0.0.0 --port 8000 --log-level warning
 
 # ── Running ───────────────────────────────────────────────────────────────────
 

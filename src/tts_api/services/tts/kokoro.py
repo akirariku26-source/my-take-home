@@ -52,6 +52,9 @@ class KokoroTTSService(TTSServiceBase):
         )
         # Thread-local storage: each worker thread gets its own KPipeline.
         self._local = threading.local()
+        # Set to True once at least one worker thread has loaded the model.
+        # Used by health_check() to avoid queuing onto the thread pool.
+        self._model_loaded = False
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -62,6 +65,7 @@ class KokoroTTSService(TTSServiceBase):
 
             logger.info("Initialising Kokoro pipeline", thread=threading.current_thread().name)
             self._local.pipeline = KPipeline(lang_code=self._lang_code)
+            self._model_loaded = True
         return self._local.pipeline
 
     def _synth_sync(self, text: str, voice: str, speed: float) -> np.ndarray:
@@ -155,14 +159,13 @@ class KokoroTTSService(TTSServiceBase):
         return list(DEFAULT_VOICES)
 
     async def health_check(self) -> bool:
-        """Verify the model can be loaded (triggers download on cold start)."""
-        loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(self._executor, self._pipeline)
-            return True
-        except Exception as exc:
-            logger.warning("Kokoro health check failed", error=str(exc))
-            return False
+        """Return True once any worker thread has successfully loaded the model.
+
+        Intentionally does NOT queue onto the thread pool — under load the pool
+        is busy with synthesis and a health check must respond immediately so
+        Kubernetes / load-balancer probes never time out.
+        """
+        return self._model_loaded
 
     async def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
