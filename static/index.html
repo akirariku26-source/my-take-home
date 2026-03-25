@@ -61,7 +61,7 @@
           id="input-text"
           class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/30 transition-colors resize-none"
           placeholder="Enter text to synthesize…"
-        >Hello! This is the TTS API developer console. You can test synthesis, chunked streaming, and the WebSocket endpoint here. Streaming mode plays audio progressively as each sentence is synthesized — ideal for voice agent applications.</textarea>
+        >Welcome to the TTS API. This system exposes three endpoints, each designed for a different use case. The Generate endpoint returns a complete audio file in one shot — best for short phrases and cache-friendly prompts where you want a single WAV back. The Stream endpoint sends audio progressively over HTTP: playback starts as soon as the first sentence is synthesized, without waiting for the full response, which cuts perceived latency significantly for longer text. The WebSocket endpoint is built for real-time voice agents. It accepts text token by token as it arrives from a language model, accumulates tokens into complete sentences, and delivers PCM audio chunks with sub-sentence latency. Together these three modes cover everything from a simple IVR prompt to a fully interactive voice agent.</textarea>
       </div>
 
       <!-- controls row -->

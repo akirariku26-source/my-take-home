@@ -91,6 +91,10 @@ class KokoroTTSService(TTSServiceBase):
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue(maxsize=_STREAM_QUEUE_SIZE)
         _cancel = cancel or threading.Event()
+        # Local event to stop the producer when this generator is abandoned
+        # (consumer disconnected mid-stream). Never set the shared session
+        # cancel here — that would abort all subsequent sentences in the session.
+        _local_cancel = threading.Event()
 
         def _produce() -> None:
             try:
@@ -98,7 +102,7 @@ class KokoroTTSService(TTSServiceBase):
                 start = time.perf_counter()
                 total_pcm_bytes = 0
                 for _g, _p, audio in pipe(text, voice=voice, speed=speed):
-                    if _cancel.is_set():
+                    if _cancel.is_set() or _local_cancel.is_set():
                         break
                     pcm = float32_to_pcm16(audio)
                     total_pcm_bytes += len(pcm)
@@ -140,9 +144,10 @@ class KokoroTTSService(TTSServiceBase):
                     raise item
                 yield item
         finally:
-            # Consumer is done (client disconnect or normal end) — signal
-            # the producer thread to stop as soon as possible.
-            _cancel.set()
+            # Signal the producer to stop if the consumer exits early (client
+            # disconnect, exception). Uses _local_cancel so the shared session
+            # cancel is not poisoned for subsequent sentences in the same session.
+            _local_cancel.set()
 
     async def get_voices(self) -> list[str]:
         from tts_api.services.tts.base import DEFAULT_VOICES
