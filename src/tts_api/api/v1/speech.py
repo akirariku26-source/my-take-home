@@ -101,23 +101,11 @@ _WS_FIRST_CHUNK = Histogram(
 
 
 def _tts(request: Request):
-    settings = request.app.state.settings
-    if settings.queue_enabled and hasattr(request.app.state, "queue_tts_service"):
-        return request.app.state.queue_tts_service
-    return request.app.state.tts_service
+    return request.app.state.services.buffered
 
 
 def _streaming_tts(request: Request):
-    """Return the gRPC service for streaming paths when available.
-
-    Prefers grpc_tts_service (direct async gRPC, zero Redis hops) over the
-    Celery queue for WebSocket and HTTP streaming.  Falls back to the regular
-    tts/queue service for local dev where the inference container is absent.
-    """
-    settings = request.app.state.settings
-    if settings.queue_enabled and hasattr(request.app.state, "grpc_tts_service"):
-        return request.app.state.grpc_tts_service
-    return _tts(request)
+    return request.app.state.services.streaming
 
 
 def _cache(request: Request):
@@ -320,22 +308,32 @@ async def list_voices(request: Request):
 @open_router.get("/health", response_model=HealthResponse, summary="Health check")
 async def health(request: Request):
     """
-    Returns 200 when the service is ready to handle requests.
-    Returns 503 when the TTS model has not loaded yet.
+    Returns 200 when all services are ready to handle requests.
+    Returns 503 when any service is unavailable (TTS model, Redis, or inference server).
     """
-    tts = _tts(request)
+    services = request.app.state.services
     cache = _cache(request)
     settings = _settings(request)
 
-    ready = await tts.health_check()
-    status = "healthy" if ready else "degraded"
-
     from tts_api import __version__
+
+    buffered_ready = await services.buffered.health_check()
+
+    # Only check streaming separately when it's a different object (queue mode).
+    # In local/dev mode they're the same instance — avoid the duplicate call.
+    if services.streaming is not services.buffered:
+        streaming_ready = await services.streaming.health_check()
+    else:
+        streaming_ready = buffered_ready
+
+    ready = buffered_ready and streaming_ready
+    status = "healthy" if ready else "degraded"
 
     resp = HealthResponse(
         status=status,
         backend=settings.backend,
-        tts_ready=ready,
+        tts_ready=buffered_ready,
+        inference_ready=streaming_ready,
         cache_size=cache.size,
         cache_max_size=cache.max_size,
         version=__version__,
@@ -390,12 +388,7 @@ async def websocket_speech(
     latency behind network I/O.
     """
     settings = websocket.app.state.settings
-    if settings.queue_enabled and hasattr(websocket.app.state, "grpc_tts_service"):
-        tts = websocket.app.state.grpc_tts_service
-    elif settings.queue_enabled and hasattr(websocket.app.state, "queue_tts_service"):
-        tts = websocket.app.state.queue_tts_service
-    else:
-        tts = websocket.app.state.tts_service
+    tts = websocket.app.state.services.streaming
 
     # Auth check before accepting — reject at the handshake level
     if not check_ws_api_key(api_key, settings):

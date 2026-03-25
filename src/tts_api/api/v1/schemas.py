@@ -52,9 +52,10 @@ class VoicesResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    status: str        # "healthy" | "degraded"
+    status: str              # "healthy" | "degraded"
     backend: str
-    tts_ready: bool
+    tts_ready: bool          # buffered service (Redis/local model)
+    inference_ready: bool    # streaming service (gRPC inference server)
     cache_size: int
     cache_max_size: int
     version: str

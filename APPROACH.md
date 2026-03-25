@@ -31,21 +31,21 @@ flowchart TD
         MW["Middleware<br/>Metrics · Rate Limit · CORS"] --> SP["POST /v1/audio/speech"]
         MW --> WS["WS /v1/audio/speech/ws"]
 
-        SP -->|cache miss| TTS
         SP -->|cache hit| CACHE["AudioCache<br/>LRU + TTL"]
-        WS --> SA["SentenceAccumulator"] --> TTS
-
-        TTS["CeleryTTSService"]
+        SP -->|buffered, cache miss| CELERY["CeleryTTSService"]
+        SP -->|streaming| GRPC["GrpcTTSService"]
+        WS --> SA["SentenceAccumulator"] --> GRPC
     end
 
-    TTS -->|enqueue task| REDIS["redis<br/>broker"]
+    CELERY -->|enqueue task| REDIS["redis<br/>broker"]
     REDIS -->|dequeue| CW
 
     subgraph celery-worker["celery-worker container (thin, CPU-only)"]
         CW["Celery worker"]
     end
 
-    CW -->|gRPC Synthesize / SynthesizeStream| INF
+    CW -->|gRPC Synthesize| INF
+    GRPC -->|gRPC SynthesizeStream<br/>direct, no Redis hops| INF
 
     subgraph tts-inference["tts-inference container (GPU-capable)"]
         INF["gRPC server"] --> POOL
@@ -57,7 +57,7 @@ flowchart TD
     end
 
     CW -->|PCM chunks via Pub/Sub| REDIS
-    REDIS -->|subscribe| TTS
+    REDIS -->|subscribe| CELERY
     tts-api -->|scrape| PROM["/metrics"]
 ```
 
@@ -113,6 +113,8 @@ I chose sentence-level buffering specifically to accommodate the Kokoro phonemiz
 
 **The Result**: We achieve the "Best of Both Worlds"—the low latency of a stream with the high-fidelity emotional cadence of a batch-processed file.
 
+**Sentence pipelining in the WebSocket path**: once a sentence boundary is detected, synthesis is dispatched as a background task immediately, while the previous sentence's audio is still being sent to the client. A bounded semaphore (`_MAX_CONCURRENT_SENTENCES = 3`) caps how many sentences can be in-flight at once per session, preventing a fast-typing client from spiking inference load. An ordered `sentence_pipe` queue ensures audio always arrives at the client in the correct sequence regardless of which sentence finishes synthesis first.
+
 ### Audio cache (LRU + TTL)
 
 A `cachetools.LRUCache` with TTL keyed by MD5 of `(text, voice, speed)` stores complete WAV files. This is high-value for voice agents that repeat common phrases ("I'm sorry, could you repeat that?", greetings, confirmation prompts), which can be served at <1ms instead of 2-5 seconds of inference. Default: 1,000 entries, 1-hour TTL.
@@ -121,17 +123,20 @@ A `cachetools.LRUCache` with TTL keyed by MD5 of `(text, voice, speed)` stores c
 
 ### Celery + Redis job queue for bursty traffic
 
-For traffic that exceeds worker capacity, a persistent job queue is more reliable than the in-process asyncio queue:
+For traffic that exceeds worker capacity, a persistent job queue is more reliable than the in-process asyncio queue. The routing depends on the request type:
 
 ```
-HTTP request → FastAPI → CeleryTTSService → Redis queue → Celery worker → gRPC → inference server
-                                                        ← Redis Pub/Sub  ←      ←
-WebSocket    → FastAPI → KokoroTTSService (direct, bypasses queue — latency-sensitive)
+HTTP buffered  → FastAPI → CeleryTTSService → Redis queue → Celery worker → gRPC → inference
+                                           ← Redis Pub/Sub ←               ←
+HTTP streaming → FastAPI → GrpcTTSService  → direct async gRPC ──────────────────→ inference
+WebSocket      → FastAPI → GrpcTTSService  → direct async gRPC ──────────────────→ inference
 ```
 
-The queue adds ~50-100ms overhead per request — negligible for buffered synthesis (2-5s total). Streaming works by the Celery worker consuming gRPC streaming chunks from the inference server and publishing each PCM chunk to a Redis Pub/Sub channel; the FastAPI process subscribes and yields chunks to the client. Workers and the inference server each scale independently.
+**Buffered requests** go through Celery, which provides durability and retry (`task_acks_late=True`). The ~50-100ms queue overhead is negligible for a 2-5s synthesis job.
 
-**Tradeoff:** Additional infrastructure (Redis, separate inference container). WebSocket always bypasses the queue to avoid latency overhead.
+**Streaming requests and WebSocket** bypass Celery entirely, using a persistent async gRPC channel (`GrpcTTSService`) directly to the inference container. This eliminates four Redis round-trips per sentence (subscribe, dispatch, N publishes, unsubscribe), reducing streaming first-chunk latency significantly.
+
+**Tradeoff:** Additional infrastructure (Redis, separate inference container). Streaming loses Celery's automatic retry, but synthesis errors are surfaced immediately to the client rather than after a retry delay — preferable for real-time audio.
 
 | | Direct (ThreadPoolExecutor) | Queued + gRPC inference |
 |---|---|---|
@@ -180,7 +185,7 @@ The window starts at `TTS_MAX_WORKERS × 2` (allows some queuing above the threa
 
 ### Pluggable TTS backends
 
-The TTS layer uses an abstract base class + factory pattern:
+The TTS layer uses an abstract base class + factory pattern with a `ServiceBundle` that cleanly separates the two request roles (buffered vs. streaming):
 
 ```mermaid
 classDiagram
@@ -206,18 +211,43 @@ classDiagram
         #_synthesize()
     }
 
-    class YourBackend["Your Backend"] {
-        #_synthesize()
-        +get_voices()
-        +health_check()
+    class CeleryTTSService {
+        +synthesize_streaming()
+        +health_check() ~Redis ping~
+    }
+
+    class GrpcTTSService {
+        -aio.Channel _channel
+        +start()
+        +synthesize_streaming()
+        +health_check() ~gRPC ping~
+    }
+
+    class ServiceBundle {
+        +TTSServiceBase buffered
+        +TTSServiceBase streaming
+        +shutdown()
     }
 
     TTSServiceBase <|-- KokoroTTSService
     TTSServiceBase <|-- MockTTSService
-    TTSServiceBase <|-- YourBackend
+    TTSServiceBase <|-- CeleryTTSService
+    TTSServiceBase <|-- GrpcTTSService
+    ServiceBundle o-- TTSServiceBase : buffered
+    ServiceBundle o-- TTSServiceBase : streaming
 ```
 
-To add a new backend: subclass `TTSServiceBase`, implement three methods, add a branch in `factory.py`, set `TTS_BACKEND=mybackend`. A reusable conformance test suite (`TTSBackendConformance`) validates any new backend against the full contract with 9 tests for free.
+`ServiceBundle` is the single contract between the factory and the rest of the application. The API layer (`speech.py`) only ever calls `services.buffered` or `services.streaming` — it has no knowledge of Celery, gRPC, or which container is running the model.
+
+`create_service_bundle(settings)` in `factory.py` is the **only** place that knows which concrete classes to instantiate:
+
+| Mode | `services.buffered` | `services.streaming` |
+|---|---|---|
+| `TTS_QUEUE_ENABLED=false` (local/dev) | `KokoroTTSService` | same instance |
+| `TTS_QUEUE_ENABLED=true` (production) | `CeleryTTSService` | `GrpcTTSService` |
+| tests | `MockTTSService` | same instance |
+
+To add a new backend: subclass `TTSServiceBase`, implement three methods, add a branch in `factory.py`. A reusable conformance test suite (`TTSBackendConformance`) validates any new backend against the full contract with 9 tests for free. No other files need to change.
 
 ### API key auth and rate limiting
 

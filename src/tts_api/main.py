@@ -30,7 +30,7 @@ from tts_api.middleware.metrics import MetricsMiddleware
 from tts_api.middleware.rate_limit import RateLimitMiddleware
 from tts_api.services.cache import AudioCache
 from tts_api.services.concurrency import AdaptiveConcurrencyLimiter
-from tts_api.services.tts.factory import create_tts_service
+from tts_api.services.tts.factory import create_service_bundle
 
 logger = get_logger(__name__)
 
@@ -42,17 +42,22 @@ async def lifespan(app: FastAPI):
 
     logger.info("tts_api_starting", backend=settings.backend, workers=settings.max_workers)
 
-    # ── TTS service ───────────────────────────────────────────────────────────
-    tts_service = create_tts_service(settings)
+    # ── TTS services ──────────────────────────────────────────────────────────
+    services = await create_service_bundle(settings)
 
-    # Warm up: trigger model download / thread-local init on all workers.
-    # This makes the first real request fast instead of slow.
     logger.info("warming_up_tts_model")
-    ready = await tts_service.health_check()
-    if ready:
-        logger.info("tts_model_ready")
+    buffered_ready = await services.buffered.health_check()
+    if buffered_ready:
+        logger.info("tts_service_ready", role="buffered")
     else:
-        logger.warning("tts_model_not_ready", note="Will retry on first request")
+        logger.warning("tts_service_not_ready", role="buffered", note="Will retry on first request")
+
+    if services.streaming is not services.buffered:
+        streaming_ready = await services.streaming.health_check()
+        if streaming_ready:
+            logger.info("tts_service_ready", role="streaming")
+        else:
+            logger.warning("tts_service_not_ready", role="streaming")
 
     # ── Audio cache ───────────────────────────────────────────────────────────
     audio_cache = AudioCache(
@@ -60,9 +65,6 @@ async def lifespan(app: FastAPI):
         ttl_seconds=settings.cache_ttl_seconds,
         enabled=settings.cache_enabled,
     )
-
-    app.state.tts_service = tts_service
-    app.state.audio_cache = audio_cache
 
     # ── Adaptive concurrency limiter ──────────────────────────────────────────
     initial = settings.adaptive_concurrency_initial or settings.max_workers * 2
@@ -73,50 +75,17 @@ async def lifespan(app: FastAPI):
         target_latency_s=settings.adaptive_concurrency_target_latency_s,
         enabled=settings.adaptive_concurrency_enabled,
     )
+
+    app.state.services = services
+    app.state.audio_cache = audio_cache
     app.state.concurrency_limiter = concurrency_limiter
-
-    # ── Queue TTS service (buffered HTTP when queue_enabled=True) ────────────
-    if settings.queue_enabled:
-        from tts_api.services.tts.celery_tts import CeleryTTSService
-        from tts_api.services.tts.grpc_tts import GrpcTTSService
-
-        queue_tts = CeleryTTSService(broker_url=settings.celery_broker_url)
-        queue_ready = await queue_tts.health_check()
-        if queue_ready:
-            logger.info("celery_queue_ready", broker=settings.celery_broker_url)
-        else:
-            logger.warning("celery_queue_not_ready", broker=settings.celery_broker_url)
-        app.state.queue_tts_service = queue_tts
-
-        # Direct async gRPC for streaming paths (WebSocket + HTTP streaming).
-        # Bypasses Celery+Redis, cutting 4 Redis round-trips per sentence to zero.
-        grpc_tts = GrpcTTSService(
-            host=settings.inference_host, port=settings.inference_port
-        )
-        await grpc_tts.start()
-        grpc_ready = await grpc_tts.health_check()
-        if grpc_ready:
-            logger.info(
-                "grpc_streaming_ready",
-                target=f"{settings.inference_host}:{settings.inference_port}",
-            )
-        else:
-            logger.warning(
-                "grpc_streaming_not_ready",
-                target=f"{settings.inference_host}:{settings.inference_port}",
-            )
-        app.state.grpc_tts_service = grpc_tts
 
     logger.info("tts_api_ready", port=settings.port)
 
     yield  # ── serve ──────────────────────────────────────────────────────────
 
     logger.info("tts_api_shutting_down")
-    await tts_service.shutdown()
-    if settings.queue_enabled and hasattr(app.state, "queue_tts_service"):
-        await app.state.queue_tts_service.shutdown()
-    if settings.queue_enabled and hasattr(app.state, "grpc_tts_service"):
-        await app.state.grpc_tts_service.shutdown()
+    await services.shutdown()
     logger.info("tts_api_stopped")
 
 

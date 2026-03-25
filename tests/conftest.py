@@ -24,7 +24,7 @@ from tts_api.core.config import Settings, get_settings
 from tts_api.main import create_app
 from tts_api.services.cache import AudioCache
 from tts_api.services.concurrency import AdaptiveConcurrencyLimiter
-from tts_api.services.tts.factory import create_tts_service
+from tts_api.services.tts.factory import create_service_bundle
 
 # Clear the lru_cache so settings re-read the env vars we just set
 get_settings.cache_clear()
@@ -44,13 +44,13 @@ async def app(settings: Settings):
     """
     application = create_app(settings)
 
-    tts = create_tts_service(settings)
+    services = await create_service_bundle(settings)
     cache = AudioCache(
         max_size=settings.cache_max_size,
         ttl_seconds=settings.cache_ttl_seconds,
         enabled=settings.cache_enabled,
     )
-    application.state.tts_service = tts
+    application.state.services = services
     application.state.audio_cache = cache
     application.state.concurrency_limiter = AdaptiveConcurrencyLimiter(
         initial=settings.max_workers * 2,
@@ -59,7 +59,7 @@ async def app(settings: Settings):
 
     yield application
 
-    await tts.shutdown()
+    await services.shutdown()
 
 
 @pytest.fixture

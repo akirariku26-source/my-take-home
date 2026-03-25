@@ -20,7 +20,7 @@ from tts_api.core.config import Settings, get_settings  # noqa: E402
 from tts_api.main import create_app  # noqa: E402
 from tts_api.services.cache import AudioCache  # noqa: E402
 from tts_api.services.concurrency import AdaptiveConcurrencyLimiter  # noqa: E402
-from tts_api.services.tts.factory import create_tts_service  # noqa: E402
+from tts_api.services.tts.factory import ServiceBundle, create_tts_service  # noqa: E402
 
 _VALID_KEY = "sk-test-valid-key"
 _OTHER_KEY = "sk-test-other-key"
@@ -33,7 +33,8 @@ def _make_app(api_keys: str = ""):
     try:
         settings = Settings()
         app = create_app(settings)
-        app.state.tts_service = create_tts_service(settings)
+        svc = create_tts_service(settings)
+        app.state.services = ServiceBundle(buffered=svc, streaming=svc)
         app.state.audio_cache = AudioCache(max_size=100, enabled=True)
         app.state.concurrency_limiter = AdaptiveConcurrencyLimiter(enabled=False)
         return app
