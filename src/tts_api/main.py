@@ -75,10 +75,10 @@ async def lifespan(app: FastAPI):
     )
     app.state.concurrency_limiter = concurrency_limiter
 
-    # ── Queue TTS service (HTTP requests when queue_enabled=True) ─────────────
-    # WebSocket handler reads app.state.tts_service directly and is unaffected.
+    # ── Queue TTS service (buffered HTTP when queue_enabled=True) ────────────
     if settings.queue_enabled:
         from tts_api.services.tts.celery_tts import CeleryTTSService
+        from tts_api.services.tts.grpc_tts import GrpcTTSService
 
         queue_tts = CeleryTTSService(broker_url=settings.celery_broker_url)
         queue_ready = await queue_tts.health_check()
@@ -88,6 +88,25 @@ async def lifespan(app: FastAPI):
             logger.warning("celery_queue_not_ready", broker=settings.celery_broker_url)
         app.state.queue_tts_service = queue_tts
 
+        # Direct async gRPC for streaming paths (WebSocket + HTTP streaming).
+        # Bypasses Celery+Redis, cutting 4 Redis round-trips per sentence to zero.
+        grpc_tts = GrpcTTSService(
+            host=settings.inference_host, port=settings.inference_port
+        )
+        await grpc_tts.start()
+        grpc_ready = await grpc_tts.health_check()
+        if grpc_ready:
+            logger.info(
+                "grpc_streaming_ready",
+                target=f"{settings.inference_host}:{settings.inference_port}",
+            )
+        else:
+            logger.warning(
+                "grpc_streaming_not_ready",
+                target=f"{settings.inference_host}:{settings.inference_port}",
+            )
+        app.state.grpc_tts_service = grpc_tts
+
     logger.info("tts_api_ready", port=settings.port)
 
     yield  # ── serve ──────────────────────────────────────────────────────────
@@ -96,6 +115,8 @@ async def lifespan(app: FastAPI):
     await tts_service.shutdown()
     if settings.queue_enabled and hasattr(app.state, "queue_tts_service"):
         await app.state.queue_tts_service.shutdown()
+    if settings.queue_enabled and hasattr(app.state, "grpc_tts_service"):
+        await app.state.grpc_tts_service.shutdown()
     logger.info("tts_api_stopped")
 
 

@@ -1,0 +1,44 @@
+FROM python:3.11-slim
+
+# ── System dependencies ───────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python setup ──────────────────────────────────────────────────────────────
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN pip install uv
+
+WORKDIR /app
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+COPY pyproject.toml uv.lock* ./
+RUN uv sync --no-dev
+
+# ── Application ───────────────────────────────────────────────────────────────
+COPY src/ src/
+COPY proto/ proto/
+
+# Re-sync so the project package is installed into the venv,
+# then install pip so Kokoro/HuggingFace can call `python -m pip` during model init.
+RUN uv sync --no-dev && uv pip install pip
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    HF_HOME=/app/.hf_cache \
+    TTS_BACKEND=kokoro \
+    TTS_MAX_WORKERS=2 \
+    TTS_INFERENCE_PORT=50051 \
+    PYTHONPATH=/app/src
+
+EXPOSE 50051
+
+# Healthcheck calls HealthCheck RPC — returns ready=true only after model warm-up.
+# start_period must cover model download (~200 MB) on first boot.
+HEALTHCHECK --interval=15s --timeout=10s --start-period=120s --retries=5 \
+    CMD python -m tts_api.inference.healthcheck || exit 1
+
+# Single inference server per container — scale horizontally with replicas.
+CMD ["python", "-m", "tts_api.inference.server"]

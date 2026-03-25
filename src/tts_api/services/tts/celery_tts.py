@@ -3,7 +3,7 @@ CeleryTTSService — TTSServiceBase implementation that dispatches synthesis
 to Celery workers via a Redis broker.
 
 Used only in the FastAPI process (tasks are submitted here, never executed).
-The WebSocket handler continues to use KokoroTTSService directly.
+Used by both HTTP and WebSocket handlers when queue_enabled=True.
 
 Buffered path
 ─────────────
@@ -65,9 +65,24 @@ class CeleryTTSService(TTSServiceBase):
             # Dispatch only after subscribing — prevents the race where the
             # worker finishes and publishes __done__ before we start listening.
             synthesize_streaming_task.delay(channel, text, voice, speed)
+            # Timeout: if no message arrives within this window the worker
+            # is assumed dead (crash, OOM, SIGKILL).  Without a timeout the
+            # coroutine hangs forever, eventually starving the event loop.
+            _CHUNK_TIMEOUT = 30.0  # seconds between consecutive messages
             try:
-                async for message in pubsub.listen():
-                    if message["type"] != "message":
+                while True:
+                    try:
+                        message = await asyncio.wait_for(
+                            pubsub.get_message(ignore_subscribe_messages=True, timeout=None),
+                            timeout=_CHUNK_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        raise RuntimeError(
+                            f"Streaming worker timed out after {_CHUNK_TIMEOUT}s "
+                            "(worker may have crashed)"
+                        )
+                    if message is None:
+                        await asyncio.sleep(0.01)
                         continue
                     data: bytes = message["data"]
                     if data == b"__done__":

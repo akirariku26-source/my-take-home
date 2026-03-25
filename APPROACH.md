@@ -27,7 +27,7 @@ flowchart TD
     REST["REST client"] -->|HTTP| MW
     AGENT["Voice agent"] -->|WebSocket| MW
 
-    subgraph FastAPI
+    subgraph tts-api["tts-api container"]
         MW["Middleware<br/>Metrics · Rate Limit · CORS"] --> SP["POST /v1/audio/speech"]
         MW --> WS["WS /v1/audio/speech/ws"]
 
@@ -35,20 +35,30 @@ flowchart TD
         SP -->|cache hit| CACHE["AudioCache<br/>LRU + TTL"]
         WS --> SA["SentenceAccumulator"] --> TTS
 
-        TTS["TTSServiceBase"] -->|run_in_executor| POOL
+        TTS["CeleryTTSService"]
+    end
+
+    TTS -->|enqueue task| REDIS["redis<br/>broker"]
+    REDIS -->|dequeue| CW
+
+    subgraph celery-worker["celery-worker container (thin, CPU-only)"]
+        CW["Celery worker"]
+    end
+
+    CW -->|gRPC Synthesize / SynthesizeStream| INF
+
+    subgraph tts-inference["tts-inference container (GPU-capable)"]
+        INF["gRPC server"] --> POOL
 
         subgraph POOL["ThreadPoolExecutor"]
             W0["Worker 0<br/>KPipeline"]
             W1["Worker 1<br/>KPipeline"]
-            WN["Worker N<br/>KPipeline"]
         end
     end
 
-    POOL -->|audio| TTS
-    TTS -->|WAV| CACHE
-    TTS -->|PCM chunks| SP
-    TTS -->|PCM chunks| WS
-    FastAPI -->|scrape| PROM["/metrics"]
+    CW -->|PCM chunks via Pub/Sub| REDIS
+    REDIS -->|subscribe| TTS
+    tts-api -->|scrape| PROM["/metrics"]
 ```
 
 ---
@@ -77,19 +87,19 @@ Direct path (TTS_QUEUE_ENABLED=false):
 │  └─ tts-worker-N  (thread, KPipeline)   │
 └─────────────────────────────────────────┘
 
-Queue path (TTS_QUEUE_ENABLED=true):
-┌──────────────────────┐   ┌──────────────────────────────┐
-│  uvicorn process      │   │  celery worker (prefork)      │
-│  (no model loaded)    │──▶│  ├─ worker-process-0          │
-│  CeleryTTSService     │   │  │   KPipeline (own memory)   │
-│  submits task →       │   │  ├─ worker-process-1          │
-│  Redis broker         │   │  │   KPipeline (own memory)   │
-└──────────────────────┘   └──────────────────────────────┘
+Queue + inference path (TTS_QUEUE_ENABLED=true, default):
+┌──────────────────────┐   ┌──────────────────┐   ┌────────────────────────┐
+│  tts-api              │   │  celery-worker    │   │  tts-inference          │
+│  uvicorn process      │   │  (thin, CPU-only) │   │  gRPC server            │
+│  (no model loaded)    │──▶│  gRPC client      │──▶│  ├─ KPipeline 0         │
+│  CeleryTTSService     │   │  (per-process     │   │  └─ KPipeline 1         │
+│  submits → Redis      │   │   channel)        │   │  (GPU-capable)          │
+└──────────────────────┘   └──────────────────┘   └────────────────────────┘
 ```
 
 In the **direct path**, the GIL is not a bottleneck: PyTorch releases it during C++ inference, so N worker threads genuinely run in parallel. A crash in a worker thread can, in the worst case, take down the whole uvicorn process.
 
-In the **queue path**, each Celery worker is a separate OS process with its own memory space. The API server never loads the model (lower base memory, faster startup). A crashing worker process does not affect the API server — Celery restarts it automatically, and `task_acks_late=True` ensures the in-flight task is re-queued rather than lost.
+In the **queue + inference path**, the model is fully isolated in its own container. The API server and Celery workers never load model weights — a crashing inference container does not affect them, and Celery's `task_acks_late=True` ensures in-flight tasks are re-queued. The inference container can be scheduled on GPU nodes independently of the CPU-only API and worker containers.
 
 ### Sentence accumulation for low-latency streaming
 
@@ -114,20 +124,23 @@ A `cachetools.LRUCache` with TTL keyed by MD5 of `(text, voice, speed)` stores c
 For traffic that exceeds worker capacity, a persistent job queue is more reliable than the in-process asyncio queue:
 
 ```
-HTTP request → FastAPI → CeleryTTSService → Redis queue → Celery worker → Redis result/Pub/Sub → client
+HTTP request → FastAPI → CeleryTTSService → Redis queue → Celery worker → gRPC → inference server
+                                                        ← Redis Pub/Sub  ←      ←
 WebSocket    → FastAPI → KokoroTTSService (direct, bypasses queue — latency-sensitive)
 ```
 
-The queue adds ~50-100ms overhead per request — negligible for buffered synthesis (2-5s total). Streaming works by publishing PCM chunks to a Redis Pub/Sub channel per sentence. Workers can scale independently of API servers.
+The queue adds ~50-100ms overhead per request — negligible for buffered synthesis (2-5s total). Streaming works by the Celery worker consuming gRPC streaming chunks from the inference server and publishing each PCM chunk to a Redis Pub/Sub channel; the FastAPI process subscribes and yields chunks to the client. Workers and the inference server each scale independently.
 
-**Tradeoff:** Additional infrastructure (Redis). WebSocket always bypasses the queue to avoid latency overhead.
+**Tradeoff:** Additional infrastructure (Redis, separate inference container). WebSocket always bypasses the queue to avoid latency overhead.
 
-| | Direct (ThreadPoolExecutor) | Queued (Celery + Redis) |
+| | Direct (ThreadPoolExecutor) | Queued + gRPC inference |
 |---|---|---|
 | Burst handling | In-memory, unbounded | Redis-backed, durable |
-| Worker scaling | Tied to API server | Independent |
+| Worker scaling | Tied to API server | Independent (worker + inference scale separately) |
+| GPU deployment | Requires GPU on API server | Inference container runs on GPU node |
 | Crash recovery | Request lost | Task re-queued (`task_acks_late=True`) |
-| Latency | None | ~50-100 ms |
+| Memory (API server) | ~2 GB per worker thread | ~128 MB (no model weights) |
+| Latency overhead | None | ~50-100 ms (queue) + <1 ms (gRPC, same cluster) |
 
 ### Adaptive concurrency control
 
@@ -261,7 +274,7 @@ The mock backend (`TTS_BACKEND=mock`) returns silent numpy arrays instantly, ena
 |---|---|---|m
 | **Performance** | Inference latency (p50/p95/p99), throughput (RPS), time-to-first-audio for streaming | Prometheus metrics + Locust load tests (already instrumented) |
 | **Audio quality** | Naturalness, intelligibility, prosody | UTMOS (automated MOS predictor), PESQ; human MOS ratings for major releases |
-| **Robustness** | Handling of edge cases — numbers, abbreviations, URLs, mixed-case, long inputs | Curated test corpus with known-good reference audio, regression-checked in CI |
+| **Robustness** | Handling of edge cases — numbers, abbreviations, URLs, mixed-case, long inputs | Curated test corpus with known-good reference audio, regression-checked in CI 0-
 | **Speaker consistency** | Same voice sounds the same across requests and model versions | Speaker embedding cosine similarity (e.g. Resemblyzer) |
 | **Resource efficiency** | Memory footprint, CPU utilization per request, cost per audio-minute | `kubectl top` + Prometheus under controlled load |
 
@@ -328,8 +341,12 @@ A Locust load test (`make loadtest`) profiles this precisely for a given pod spe
 
 3. **SSML support** — prosody, pauses, and phoneme overrides matter for production voice agents.
 
-4. **Async model warm-up** — currently the first request to each worker thread triggers model initialization (~2-4s). A background warm-up task on startup would eliminate cold-start latency spikes.
+4. **Structured audio events in WebSocket** — emit sentence-level timestamps so clients can synchronize lip animation or subtitles.
 
-5. **Structured audio events in WebSocket** — emit sentence-level timestamps so clients can synchronize lip animation or subtitles.
+5. **mTLS between services** — the gRPC channel between celery-worker and tts-inference currently uses an insecure connection. In production, add mTLS so only authorised workers can call the inference server.
 
-6. **Production deployment** — the Docker image and `docker-compose.yml` are ready. Add: a reverse proxy for TLS termination, a Prometheus + Grafana stack for dashboards, and auto-scaling based on the `tts_active_websocket_connections` gauge.
+6. **GPU deployment** — the `tts-inference` container is GPU-ready: set `TTS_MAX_WORKERS=1`, attach a CUDA device (`deploy.resources.reservations.devices`), and rebuild with a CUDA-enabled PyTorch base. The rest of the stack (tts-api, celery-worker) stays on CPU-only nodes.
+
+7. **Inference auto-scaling** — expose `tts_concurrency_in_flight` from the inference server and drive K8s HPA on it, scaling inference replicas independently from the API tier.
+
+8. **Production deployment** — `docker-compose.yml` and both Dockerfiles are ready. Add: a reverse proxy for TLS termination, a Prometheus + Grafana stack for dashboards, and auto-scaling rules for each tier.

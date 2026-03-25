@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package tts;
+
+// TTS inference service — runs inside the tts-inference container.
+// The Celery worker calls this service to offload all model work,
+// keeping itself lightweight and deployable on CPU-only nodes while
+// inference runs on dedicated (potentially GPU) hardware.
+service TTSInference {
+  // Synthesize full text and return a complete WAV file.
+  rpc Synthesize (SynthesizeRequest) returns (SynthesizeResponse);
+
+  // Synthesize text sentence-by-sentence and stream PCM chunks back
+  // as each sentence is produced, enabling low-latency streaming.
+  rpc SynthesizeStream (SynthesizeRequest) returns (stream AudioChunk);
+
+  // Readiness probe — returns ready=true once the model is loaded and
+  // has completed at least one warm-up inference pass.
+  rpc HealthCheck (HealthRequest) returns (HealthResponse);
+}
+
+message SynthesizeRequest {
+  string text  = 1;
+  string voice = 2;
+  float  speed = 3;
+}
+
+// Complete WAV file (44-byte RIFF header + int16 PCM).
+message SynthesizeResponse {
+  bytes wav_bytes = 1;
+}
+
+// One PCM chunk in a streaming response — raw int16 PCM, no header.
+message AudioChunk {
+  bytes pcm_bytes = 1;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ready = 1;
+}

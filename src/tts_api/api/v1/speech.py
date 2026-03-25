@@ -8,6 +8,7 @@ GET  /metrics                  – Prometheus metrics
 WS   /v1/audio/speech/ws       – real-time streaming for voice agents
 """
 
+import asyncio
 import json
 import threading
 import time
@@ -88,6 +89,12 @@ _WS_ERRORS = Counter(
     "WebSocket session errors by error class",
     ["error_type"],
 )
+_WS_FIRST_CHUNK = Histogram(
+    "tts_websocket_first_chunk_seconds",
+    "Latency from synthesis request to first audio chunk over WebSocket",
+    ["voice"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
 
 
 # ── Dependency helpers ────────────────────────────────────────────────────────
@@ -98,6 +105,19 @@ def _tts(request: Request):
     if settings.queue_enabled and hasattr(request.app.state, "queue_tts_service"):
         return request.app.state.queue_tts_service
     return request.app.state.tts_service
+
+
+def _streaming_tts(request: Request):
+    """Return the gRPC service for streaming paths when available.
+
+    Prefers grpc_tts_service (direct async gRPC, zero Redis hops) over the
+    Celery queue for WebSocket and HTTP streaming.  Falls back to the regular
+    tts/queue service for local dev where the inference container is absent.
+    """
+    settings = request.app.state.settings
+    if settings.queue_enabled and hasattr(request.app.state, "grpc_tts_service"):
+        return request.app.state.grpc_tts_service
+    return _tts(request)
 
 
 def _cache(request: Request):
@@ -166,7 +186,10 @@ async def create_speech(body: SpeechRequest, request: Request):
     )
     if body.stream or auto_streamed:
         extra = {"X-Auto-Streamed": "true"} if auto_streamed else {}
-        return _stream_response(text, voice, speed, body.response_format, tts, limiter, extra)
+        return _stream_response(
+            text, voice, speed, body.response_format,
+            _streaming_tts(request), limiter, extra,
+        )
 
     # ── Non-streaming ─────────────────────────────────────────────────────────
     with _LATENCY.time():
@@ -357,14 +380,22 @@ async def websocket_speech(
       Subsequent:  binary frames — raw int16 PCM at sample_rate Hz
       Final frame: JSON {"type":"done"}
 
-    Design note
-    ───────────
-    Text chunks are accumulated in a SentenceAccumulator.  TTS is triggered on
-    each complete sentence, so audio starts arriving after the *first sentence*
-    rather than after the full turn — critical for low-latency voice agents.
+    Design note — pipelined synthesis
+    ──────────────────────────────────
+    A _receiver task reads incoming text and dispatches a synthesis background
+    task for each complete sentence immediately, without waiting for the
+    previous sentence to finish.  A _sender task drains an ordered sentence
+    pipe and streams audio to the client in order.  This lets synthesis of
+    sentence N+1 overlap with sending sentence N's audio, hiding inference
+    latency behind network I/O.
     """
-    tts = websocket.app.state.tts_service
     settings = websocket.app.state.settings
+    if settings.queue_enabled and hasattr(websocket.app.state, "grpc_tts_service"):
+        tts = websocket.app.state.grpc_tts_service
+    elif settings.queue_enabled and hasattr(websocket.app.state, "queue_tts_service"):
+        tts = websocket.app.state.queue_tts_service
+    else:
+        tts = websocket.app.state.tts_service
 
     # Auth check before accepting — reject at the handshake level
     if not check_ws_api_key(api_key, settings):
@@ -380,7 +411,6 @@ async def websocket_speech(
     accumulator = SentenceAccumulator()
     cancel = threading.Event()
 
-    # Send session metadata so the client knows how to decode PCM frames
     await websocket.send_json(
         {
             "type": "ready",
@@ -391,61 +421,118 @@ async def websocket_speech(
         }
     )
 
-    async def _synthesize_and_send(text: str) -> None:
-        async for pcm_chunk in tts.synthesize_streaming(text, voice, speed, cancel=cancel):
-            await websocket.send_bytes(pcm_chunk)
+    # sentence_pipe carries items in dispatch order:
+    #   asyncio.Queue  — per-sentence chunk queue (fill by synthesis task)
+    #   _PIPE_FLUSH    — end-of-turn sentinel (send {"type":"done"} then continue)
+    #   _PIPE_STOP     — session-end sentinel (sender exits)
+    _PIPE_FLUSH = object()
+    _PIPE_STOP = object()
+    sentence_pipe: asyncio.Queue = asyncio.Queue()
+
+    # Limit how many sentences can be in-flight at once per session.
+    # Without this, a fast client can fire unlimited concurrent gRPC streams,
+    # spiking inference server load and triggering cascading failures.
+    _MAX_CONCURRENT_SENTENCES = 3
+    _dispatch_sem = asyncio.Semaphore(_MAX_CONCURRENT_SENTENCES)
+
+    async def _dispatch(chunk_q: asyncio.Queue, text: str, _voice: str, _speed: float) -> None:
+        """Background task: stream synthesis chunks into chunk_q in order."""
+        async with _dispatch_sem:
+            start = time.perf_counter()
+            first = True
+            try:
+                async for pcm in tts.synthesize_streaming(text, _voice, _speed, cancel=cancel):
+                    if first:
+                        _WS_FIRST_CHUNK.labels(voice=_voice).observe(time.perf_counter() - start)
+                        first = False
+                    await chunk_q.put(pcm)
+            except Exception as exc:
+                await chunk_q.put(exc)
+            finally:
+                await chunk_q.put(None)  # always signal end-of-sentence
+
+    def _enqueue_sentence(text: str) -> None:
+        """Register a sentence in the pipe and fire its synthesis task."""
+        chunk_q: asyncio.Queue = asyncio.Queue()
+        # Put chunk_q before creating the task so sentence_pipe order is
+        # guaranteed even if two sentences are enqueued back-to-back.
+        sentence_pipe.put_nowait(chunk_q)
+        asyncio.create_task(_dispatch(chunk_q, text, voice, speed))
+
+    async def _sender() -> None:
+        """Drain sentence_pipe in order; send audio chunks to the client."""
+        while True:
+            item = await sentence_pipe.get()
+            if item is _PIPE_STOP:
+                return
+            if item is _PIPE_FLUSH:
+                try:
+                    await websocket.send_json({"type": "done"})
+                except WebSocketDisconnect:
+                    return
+                _WS_TURNS.inc()
+                continue
+            chunk_q: asyncio.Queue = item
+            while True:
+                chunk = await chunk_q.get()
+                if chunk is None:
+                    break
+                if isinstance(chunk, Exception):
+                    raise chunk
+                try:
+                    await websocket.send_bytes(chunk)
+                except WebSocketDisconnect:
+                    return
+
+    async def _receiver() -> None:
+        nonlocal voice, speed
+        try:
+            while True:
+                message = await websocket.receive()
+                if message["type"] == "websocket.disconnect":
+                    break
+                if message["type"] != "websocket.receive":
+                    continue
+                raw = message.get("text") or message.get("bytes")
+                if raw is None:
+                    continue
+                if isinstance(raw, bytes):
+                    raw = raw.decode()
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    await websocket.send_json({"type": "error", "message": "Invalid JSON"})
+                    continue
+                msg_type = data.get("type")
+                if msg_type == "config":
+                    voice = data.get("voice", voice)
+                    speed = float(data.get("speed", speed))
+                elif msg_type == "text":
+                    for sentence in accumulator.push(data.get("text", "")):
+                        _enqueue_sentence(sentence)
+                elif msg_type == "flush":
+                    for sentence in accumulator.flush():
+                        _enqueue_sentence(sentence)
+                    sentence_pipe.put_nowait(_PIPE_FLUSH)
+                else:
+                    await websocket.send_json(
+                        {"type": "error", "message": f"Unknown message type: {msg_type!r}"}
+                    )
+        except WebSocketDisconnect:
+            pass
+        finally:
+            cancel.set()
+            sentence_pipe.put_nowait(_PIPE_STOP)
 
     try:
-        while True:
-            message = await websocket.receive()
-
-            if message["type"] == "websocket.disconnect":
-                break
-
-            if message["type"] != "websocket.receive":
-                continue
-
-            raw = message.get("text") or message.get("bytes")
-            if raw is None:
-                continue
-
-            if isinstance(raw, bytes):
-                raw = raw.decode()
-
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                await websocket.send_json({"type": "error", "message": "Invalid JSON"})
-                continue
-
-            msg_type = data.get("type")
-
-            if msg_type == "config":
-                voice = data.get("voice", voice)
-                speed = float(data.get("speed", speed))
-
-            elif msg_type == "text":
-                chunk = data.get("text", "")
-                sentences = accumulator.push(chunk)
-                for sentence in sentences:
-                    await _synthesize_and_send(sentence)
-
-            elif msg_type == "flush":
-                # End of LLM turn — synthesize any remaining buffered text
-                for sentence in accumulator.flush():
-                    await _synthesize_and_send(sentence)
-                await websocket.send_json({"type": "done"})
-                _WS_TURNS.inc()
-
-            else:
-                await websocket.send_json(
-                    {"type": "error", "message": f"Unknown message type: {msg_type!r}"}
-                )
-
-    except WebSocketDisconnect:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(_receiver())
+            tg.create_task(_sender())
+    except* WebSocketDisconnect:
+        pass
+    except* Exception as eg:
         cancel.set()
-    except Exception as exc:
-        cancel.set()
+        exc = eg.exceptions[0]
         logger.error("websocket_error", error=str(exc))
         _WS_ERRORS.labels(error_type=classify_error(exc)).inc()
         try:

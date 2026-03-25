@@ -44,9 +44,16 @@ class Settings(BaseSettings):
     # Rule of thumb: match physical CPU cores or set to 2x for IO-heavy workloads.
     max_workers: int = 4
 
+    # ── gRPC inference server ─────────────────────────────────────────────────
+    # Host/port of the tts-inference container.  Used by GrpcTTSService when
+    # queue_enabled=True for zero-overhead streaming paths (WebSocket and HTTP
+    # streaming), bypassing Celery+Redis entirely.
+    inference_host: str = "localhost"
+    inference_port: int = 50051
+
     # ── Job queue (Celery + Redis) ─────────────────────────────────────────────
-    # Set TTS_QUEUE_ENABLED=true to route HTTP synthesis through Celery workers.
-    # WebSocket always uses the direct ThreadPoolExecutor path regardless.
+    # Set TTS_QUEUE_ENABLED=true to route synthesis through Celery workers.
+    # Both HTTP and WebSocket paths respect this flag.
     queue_enabled: bool = False
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend_url: str = "redis://localhost:6379/0"

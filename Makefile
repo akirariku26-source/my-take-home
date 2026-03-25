@@ -1,5 +1,5 @@
-.PHONY: setup install dev test test-fast loadtest lint lint-fix format format-check typecheck \
-        run run-queue run-prod docker-build docker-up docker-down clean help
+.PHONY: setup install dev proto test test-fast loadtest lint lint-fix format format-check typecheck \
+        run run-queue run-prod docker-build docker-build-inference docker-up docker-down clean help
 
 UV         := uv
 APP_MODULE := tts_api.main:app
@@ -21,6 +21,20 @@ install: ## Install production dependencies only
 
 dev: ## Install dev dependencies
 	$(UV) sync --all-extras
+
+# ── Proto / gRPC ──────────────────────────────────────────────────────────────
+
+proto: ## Regenerate gRPC Python stubs from proto/tts.proto (requires dev deps)
+	$(UV) run python -m grpc_tools.protoc \
+	  -I proto \
+	  --python_out=src/tts_api/inference \
+	  --grpc_python_out=src/tts_api/inference \
+	  proto/tts.proto
+	# Fix the bare `import tts_pb2` the generator emits → package-qualified import
+	sed -i.bak 's/^import tts_pb2/from tts_api.inference import tts_pb2/' \
+	  src/tts_api/inference/tts_pb2_grpc.py && \
+	rm -f src/tts_api/inference/tts_pb2_grpc.py.bak
+	@echo "Stubs written to src/tts_api/inference/"
 
 # ── Code quality ──────────────────────────────────────────────────────────────
 
@@ -71,10 +85,13 @@ run-prod: ## Start production server (4 workers)
 
 # ── Docker ────────────────────────────────────────────────────────────────────
 
-docker-build: ## Build Docker image
+docker-build: ## Build API + worker Docker image
 	docker build -t $(DOCKER_IMG) .
 
-docker-up: ## Start all services with docker-compose
+docker-build-inference: ## Build inference server Docker image
+	docker build -f Dockerfile.inference -t $(DOCKER_IMG)-inference .
+
+docker-up: ## Start all services with docker-compose (API, celery-worker, tts-inference, redis)
 	docker compose up -d
 
 docker-down: ## Stop docker-compose services

@@ -5,75 +5,89 @@ Worker process lifecycle
 ────────────────────────
 Celery prefork spawns a separate OS process per concurrency slot.
 _init_tts_worker() runs once per forked process (via worker_process_init
-signal) and stores a KokoroTTSService in the process-global _tts_service.
-This mirrors the thread-local KPipeline pattern from kokoro.py, adapted for
-process-level isolation.
+signal) and creates a persistent gRPC channel + stub to the tts-inference
+container.  No model weights are loaded in this process — all inference is
+delegated to the inference server over gRPC.
 
-Tasks call _tts_service._pipeline() and _tts_service._synth_sync() directly
-— the ThreadPoolExecutor inside KokoroTTSService is not used here because
-each Celery worker process IS a dedicated execution slot.
+Task flow
+─────────
+  synthesize_buffered_task  →  stub.Synthesize()       →  inference server
+  synthesize_streaming_task →  stub.SynthesizeStream() →  inference server
+                             →  publish PCM chunks to Redis Pub/Sub channel
+                             →  CeleryTTSService (FastAPI) consumes via subscribe
+
+The Redis Pub/Sub interface on the FastAPI side (CeleryTTSService) is
+unchanged — gRPC replaces the previous in-process Kokoro calls while
+keeping the same message protocol on the broker.
 """
 
-import os
+import grpc
+from celery.signals import worker_process_init, worker_shutdown
 
-import redis as sync_redis
-from celery.signals import worker_process_init
-
+from tts_api.inference import tts_pb2
+from tts_api.inference.client import create_channel, create_stub
 from tts_api.workers.celery_app import broker_url, celery_app
 
-_tts_service = None  # set by _init_tts_worker; None in the FastAPI process
+_channel: grpc.Channel | None = None
+_stub = None
 
 
 @worker_process_init.connect
 def _init_tts_worker(**kwargs):
-    """Initialize one KokoroTTSService per Celery worker process."""
-    global _tts_service
-    from tts_api.services.tts.kokoro import KokoroTTSService
+    """Create a gRPC channel to the inference server, one per worker process."""
+    global _channel, _stub
+    _channel = create_channel()
+    _stub = create_stub(_channel)
 
-    lang_code = os.environ.get("TTS_KOKORO_LANG_CODE", "a")
-    _tts_service = KokoroTTSService(lang_code=lang_code, max_workers=1)
-    # Eagerly warm up so the first task doesn't pay the model-load cost.
-    _tts_service._pipeline()
+
+@worker_shutdown.connect
+def _shutdown_tts_worker(**kwargs):
+    """Drain in-flight RPCs and close the channel on worker shutdown."""
+    global _channel
+    if _channel is not None:
+        _channel.close()
 
 
 @celery_app.task(name="tts.synthesize_buffered")
 def synthesize_buffered_task(text: str, voice: str, speed: float) -> str:
     """
-    Synthesize text and return a complete WAV file encoded as a hex string.
+    Synthesize text via the inference server and return a complete WAV file
+    encoded as a hex string.
 
-    Returns hex (not raw bytes) so Celery's JSON serializer can transport it.
+    Returns hex (not raw bytes) so Celery's JSON serialiser can transport it.
     The caller decodes with bytes.fromhex().
     """
-    if _tts_service is None:
-        raise RuntimeError("TTS service not initialized (worker_process_init not fired)")
+    if _stub is None:
+        raise RuntimeError("gRPC stub not initialised (worker_process_init not fired)")
 
-    from tts_api.services.audio import audio_to_wav
-
-    audio = _tts_service._synth_sync(text, voice, speed)
-    wav = audio_to_wav(audio, _tts_service.sample_rate)
-    return wav.hex()
+    response = _stub.Synthesize(
+        tts_pb2.SynthesizeRequest(text=text, voice=voice, speed=speed),
+        timeout=120,
+    )
+    return response.wav_bytes.hex()
 
 
 @celery_app.task(name="tts.synthesize_streaming")
 def synthesize_streaming_task(channel: str, text: str, voice: str, speed: float) -> None:
     """
-    Synthesize text sentence-by-sentence, publishing PCM chunks to a Redis
-    Pub/Sub channel as each sentence is produced.
+    Stream synthesis from the inference server sentence-by-sentence, publishing
+    each PCM chunk to a Redis Pub/Sub channel as it arrives.
 
-    Publishes b"__done__" as the final message to signal completion.
+    Publishes b"__done__" as the final sentinel to signal completion.
     Publishes b"__error__:<message>" on failure.
     """
-    if _tts_service is None:
-        raise RuntimeError("TTS service not initialized (worker_process_init not fired)")
+    if _stub is None:
+        raise RuntimeError("gRPC stub not initialised (worker_process_init not fired)")
 
-    from tts_api.services.audio import float32_to_pcm16
+    import redis as sync_redis
 
     r = sync_redis.Redis.from_url(broker_url)
     try:
-        pipe = _tts_service._pipeline()
-        for _g, _p, audio in pipe(text, voice=voice, speed=speed):
-            pcm = float32_to_pcm16(audio)
-            r.publish(channel, pcm)
+        for chunk in _stub.SynthesizeStream(
+            tts_pb2.SynthesizeRequest(text=text, voice=voice, speed=speed),
+            timeout=120,
+        ):
+            r.publish(channel, chunk.pcm_bytes)
         r.publish(channel, b"__done__")
     except Exception as exc:
         r.publish(channel, f"__error__:{exc}".encode())
