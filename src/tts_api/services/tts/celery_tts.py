@@ -58,11 +58,13 @@ class CeleryTTSService(TTSServiceBase):
         Pub/Sub as the worker produces them sentence by sentence.
         """
         channel = f"tts:stream:{uuid4().hex}"
-        synthesize_streaming_task.delay(channel, text, voice, speed)
 
         async with aioredis.from_url(self._broker_url) as r:
             pubsub = r.pubsub()
             await pubsub.subscribe(channel)
+            # Dispatch only after subscribing — prevents the race where the
+            # worker finishes and publishes __done__ before we start listening.
+            synthesize_streaming_task.delay(channel, text, voice, speed)
             try:
                 async for message in pubsub.listen():
                     if message["type"] != "message":

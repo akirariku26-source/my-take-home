@@ -21,6 +21,13 @@ RUN uv sync --no-dev
 
 # ── Application ───────────────────────────────────────────────────────────────
 COPY src/ src/
+COPY static/ static/
+
+# Re-sync so the project package itself is installed into the venv,
+# then install pip so Kokoro/HuggingFace can call `python -m pip` during model init.
+RUN uv sync --no-dev && uv pip install pip
+
+ENV PATH="/app/.venv/bin:$PATH"
 
 # ── Runtime config ────────────────────────────────────────────────────────────
 # HuggingFace model cache (mount a volume for persistence across restarts)
@@ -28,7 +35,8 @@ ENV HF_HOME=/app/.hf_cache \
     TTS_BACKEND=kokoro \
     TTS_HOST=0.0.0.0 \
     TTS_PORT=8000 \
-    TTS_MAX_WORKERS=4
+    TTS_MAX_WORKERS=4 \
+    PYTHONPATH=/app/src
 
 EXPOSE 8000
 
@@ -36,5 +44,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Single-process per container — scale horizontally with replicas
-CMD ["uv", "run", "uvicorn", "tts_api.main:app", \
+CMD ["uvicorn", "tts_api.main:app", \
      "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

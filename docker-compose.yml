@@ -23,6 +23,7 @@ services:
     env_file: .env
     environment:
       # Docker-internal service discovery overrides (use service name, not localhost)
+      TTS_QUEUE_ENABLED: "true"
       TTS_CELERY_BROKER_URL: "redis://redis:6379/0"
       TTS_CELERY_RESULT_BACKEND_URL: "redis://redis:6379/0"
       HF_HOME: /app/.hf_cache
@@ -46,8 +47,8 @@ services:
   celery-worker:
     build: .
     command: >
-      uv run celery -A tts_api.workers.celery_app:celery_app worker
-      --loglevel=info --concurrency=2 --pool=prefork
+      /app/.venv/bin/celery -A tts_api.workers.celery_app:celery_app worker
+      --loglevel=info --concurrency=2 --pool=solo
     volumes:
       # Share model weights with tts-api — downloaded once, used by both
       - hf-cache:/app/.hf_cache
