@@ -38,7 +38,7 @@ import time
 from abc import ABC, abstractmethod
 
 from tts_api.services.audio import SAMPLE_RATE
-from tts_api.services.tts.metrics import MODEL_LATENCY, REAL_TIME_FACTOR
+from tts_api.services.tts.metrics import MODEL_ERRORS, MODEL_LATENCY, REAL_TIME_FACTOR, classify_error
 
 # Canonical voice list shared by all backends.  When adding a new voice to
 # Kokoro update this list — every backend (including Mock and Celery) reads
@@ -72,7 +72,11 @@ class TTSServiceBase(ABC):
         automatically — subclasses implement _synthesize(), not this method.
         """
         start = time.perf_counter()
-        wav = await self._synthesize(text, voice, speed)
+        try:
+            wav = await self._synthesize(text, voice, speed)
+        except Exception as exc:
+            MODEL_ERRORS.labels(voice=voice, mode="buffered", error_type=classify_error(exc)).inc()
+            raise
         elapsed = time.perf_counter() - start
         MODEL_LATENCY.labels(voice=voice, mode="buffered").observe(elapsed)
         # RTF = inference_time / audio_duration.  WAV has a 44-byte header;

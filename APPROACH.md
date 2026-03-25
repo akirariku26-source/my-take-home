@@ -65,6 +65,32 @@ For streaming, a worker thread pushes PCM chunks into an `asyncio.Queue(maxsize=
 
 **Tradeoff:** Each thread-local `KPipeline` costs ~1-2 GB. With `TTS_MAX_WORKERS=4`, that's 4-8 GB baseline. This is the cost of true parallelism.
 
+**Process isolation modes:** Where the model actually runs depends on whether the job queue is enabled:
+
+```
+Direct path (TTS_QUEUE_ENABLED=false):
+┌─────────────────────────────────────────┐
+│  uvicorn process                         │
+│  ├─ asyncio event loop                  │
+│  ├─ tts-worker-0  (thread, KPipeline)   │
+│  ├─ tts-worker-1  (thread, KPipeline)   │
+│  └─ tts-worker-N  (thread, KPipeline)   │
+└─────────────────────────────────────────┘
+
+Queue path (TTS_QUEUE_ENABLED=true):
+┌──────────────────────┐   ┌──────────────────────────────┐
+│  uvicorn process      │   │  celery worker (prefork)      │
+│  (no model loaded)    │──▶│  ├─ worker-process-0          │
+│  CeleryTTSService     │   │  │   KPipeline (own memory)   │
+│  submits task →       │   │  ├─ worker-process-1          │
+│  Redis broker         │   │  │   KPipeline (own memory)   │
+└──────────────────────┘   └──────────────────────────────┘
+```
+
+In the **direct path**, the GIL is not a bottleneck: PyTorch releases it during C++ inference, so N worker threads genuinely run in parallel. A crash in a worker thread can, in the worst case, take down the whole uvicorn process.
+
+In the **queue path**, each Celery worker is a separate OS process with its own memory space. The API server never loads the model (lower base memory, faster startup). A crashing worker process does not affect the API server — Celery restarts it automatically, and `task_acks_late=True` ensures the in-flight task is re-queued rather than lost.
+
 ### Sentence accumulation for low-latency streaming
 
 **Linguistic Context vs. Latency**
@@ -200,6 +226,8 @@ Metrics are recorded at two independent layers so every failure mode is visible 
 | `histogram_quantile(0.5, rate(tts_real_time_factor_bucket[5m]))` | Median RTF — <1.0 means faster than real-time |
 | `rate(tts_cache_hits_total[5m]) / rate(tts_requests_total[5m])` | Cache hit ratio |
 | `tts_active_websocket_connections` | Live voice-agent sessions |
+| `rate(tts_model_errors_total[5m])` | Model failure rate by `error_type` (`oom`, `invalid_input`, `timeout`, `torch_error`) |
+| `tts_cache_size` | Current cache utilisation (entries) |
 
 A key production metric is **Real-Time Factor (RTF)** — `inference_time / audio_duration`. RTF < 1.0 means synthesis is faster than playback (good); RTF > 1.0 means the model can't keep up with real-time. This is recorded automatically as `tts_real_time_factor` for both buffered and streaming modes, labeled by voice. For streaming voice agents, RTF directly determines whether audio gaps occur between sentences.
 
@@ -222,6 +250,8 @@ The mock backend (`TTS_BACKEND=mock`) returns silent numpy arrays instantly, ena
 **Voice cloning / custom voices** — Out of scope for a generic TTS API.
 
 **Multi-language** — Kokoro covers American and British English. Other languages would require a multilingual model (StyleTTS2, Coqui XTTS) or language-specific backend instances — straightforward with the pluggable backend pattern.
+
+**User management and request history** — The API is stateless and anonymous. A natural extension would be per-user accounts with request history (text, voice, timestamp, duration), quotas tied to user identity rather than IP, and persistent storage of generated audio so users can retrieve or re-download past results without re-synthesising. This would require a database (Postgres), an object store (S3 / GCS) for audio files, and an auth layer that issues user tokens rather than shared API keys.
 
 **CI/CD pipeline** — No GitHub Actions workflows for running tests, linting, or deploying to a sandbox environment. In production I'd add: a CI job that runs `make lint` + `make test` on every PR, a build step that pushes the Docker image to a registry, and a CD step that deploys to a staging environment on merge to `main`. The Makefile targets and Dockerfile are already structured for this — the missing piece is the workflow YAML and a deployment target (e.g. Fly.io, Railway, or a K8s cluster).
 

@@ -20,15 +20,12 @@ services:
     volumes:
       # Persist HuggingFace model weights across restarts (~200 MB first download)
       - hf-cache:/app/.hf_cache
+    env_file: .env
     environment:
-      TTS_BACKEND: kokoro
-      TTS_MAX_WORKERS: "4"
-      TTS_RATE_LIMIT_RPM: "120"
-      TTS_RATE_LIMIT_BURST: "20"
-      TTS_CACHE_MAX_SIZE: "2000"
-      TTS_QUEUE_ENABLED: "true"
+      # Docker-internal service discovery overrides (use service name, not localhost)
       TTS_CELERY_BROKER_URL: "redis://redis:6379/0"
       TTS_CELERY_RESULT_BACKEND_URL: "redis://redis:6379/0"
+      HF_HOME: /app/.hf_cache
     depends_on:
       redis:
         condition: service_healthy
@@ -54,9 +51,9 @@ services:
     volumes:
       # Share model weights with tts-api — downloaded once, used by both
       - hf-cache:/app/.hf_cache
+    env_file: .env
     environment:
-      TTS_BACKEND: kokoro
-      TTS_KOKORO_LANG_CODE: "a"
+      # Docker-internal service discovery overrides (use service name, not localhost)
       TTS_CELERY_BROKER_URL: "redis://redis:6379/0"
       TTS_CELERY_RESULT_BACKEND_URL: "redis://redis:6379/0"
       HF_HOME: /app/.hf_cache

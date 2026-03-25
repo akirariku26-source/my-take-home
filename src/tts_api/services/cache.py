@@ -11,8 +11,11 @@ import time
 from hashlib import md5
 
 from cachetools import LRUCache
+from prometheus_client import Gauge
 
 from tts_api.core.logging import get_logger
+
+_CACHE_SIZE = Gauge("tts_cache_size", "Current number of entries in the audio cache")
 
 logger = get_logger(__name__)
 
@@ -44,6 +47,7 @@ class AudioCache:
             if time.monotonic() > self._expiry.get(key, 0.0):
                 del self._store[key]
                 self._expiry.pop(key, None)
+                _CACHE_SIZE.set(len(self._store))
                 return None
             return self._store[key]
 
@@ -54,6 +58,7 @@ class AudioCache:
         async with self._lock:
             self._store[key] = audio
             self._expiry[key] = time.monotonic() + self._ttl
+            _CACHE_SIZE.set(len(self._store))
 
     @property
     def size(self) -> int:

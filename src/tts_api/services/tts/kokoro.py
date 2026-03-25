@@ -30,7 +30,12 @@ import numpy as np
 from tts_api.core.logging import get_logger
 from tts_api.services.audio import SAMPLE_RATE, audio_to_wav, float32_to_pcm16
 from tts_api.services.tts.base import TTSServiceBase
-from tts_api.services.tts.metrics import MODEL_LATENCY, REAL_TIME_FACTOR
+from tts_api.services.tts.metrics import (
+    MODEL_ERRORS,
+    MODEL_LATENCY,
+    REAL_TIME_FACTOR,
+    classify_error,
+)
 
 logger = get_logger(__name__)
 
@@ -114,6 +119,9 @@ class KokoroTTSService(TTSServiceBase):
                         )
             except Exception as exc:
                 if not _cancel.is_set():
+                    MODEL_ERRORS.labels(
+                        voice=voice, mode="streaming", error_type=classify_error(exc)
+                    ).inc()
                     asyncio.run_coroutine_threadsafe(queue.put(exc), loop).result(timeout=5)
             finally:
                 try:

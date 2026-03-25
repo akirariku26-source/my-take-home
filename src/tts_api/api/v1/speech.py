@@ -24,6 +24,8 @@ from fastapi import (  # noqa: E501
 from fastapi.responses import Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
+from tts_api.services.tts.metrics import classify_error
+
 from tts_api.api.deps import check_ws_api_key, verify_api_key
 from tts_api.api.v1.schemas import (
     AudioFormat,
@@ -80,6 +82,11 @@ _WS_SESSION_DURATION = Histogram(
 _WS_TURNS = Counter(
     "tts_websocket_turns_total",
     "Completed voice-agent turns (flush events) over WebSocket",
+)
+_WS_ERRORS = Counter(
+    "tts_websocket_errors_total",
+    "WebSocket session errors by error class",
+    ["error_type"],
 )
 
 
@@ -185,7 +192,9 @@ async def create_speech(body: SpeechRequest, request: Request):
                 wav_bytes = await tts.synthesize(text, voice, speed)
             except Exception as exc:
                 logger.error("synthesis_failed", voice=voice, error=str(exc))
-                _REQUESTS.labels(voice=voice, format=body.response_format.value, status="error").inc()
+                _REQUESTS.labels(
+                    voice=voice, format=body.response_format.value, status="error"
+                ).inc()
                 raise HTTPException(500, "TTS synthesis failed") from exc
 
         await cache.set(text, voice, speed, wav_bytes)
@@ -241,6 +250,9 @@ def _stream_response(
                     byte_count += len(pcm_chunk)
             except Exception as exc:
                 logger.error("stream_error", voice=voice, error=str(exc))
+                _REQUESTS.labels(
+                    voice=voice, format=f"{fmt.value}-stream", status="error"
+                ).inc()
                 raise
 
             _STREAM_DURATION.labels(voice=voice).observe(time.perf_counter() - start)
@@ -435,6 +447,7 @@ async def websocket_speech(
     except Exception as exc:
         cancel.set()
         logger.error("websocket_error", error=str(exc))
+        _WS_ERRORS.labels(error_type=classify_error(exc)).inc()
         try:
             await websocket.close(code=1011)
         except Exception:
