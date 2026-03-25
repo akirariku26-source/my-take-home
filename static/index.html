@@ -557,8 +557,9 @@
     _activeWS = ws;
     ws.binaryType = 'arraybuffer';
 
-    _player = new StreamingPlayer(24000);
-    await _player.start();
+    const localPlayer = new StreamingPlayer(24000);
+    await localPlayer.start();
+    _player = localPlayer;
 
     const words = el('input-text').value.trim().split(/\s+/);
     let wordIdx = 0, sendInterval = null;
@@ -569,7 +570,7 @@
       if (evt.data instanceof ArrayBuffer) {
         const chunk = new Uint8Array(evt.data);
         if (ttfa === null) { ttfa = Date.now() - t0; }
-        _player.push(chunk);
+        localPlayer.push(chunk);
         totalBytes += chunk.byteLength;
         logWS('← audio  ' + fmtBytes(chunk.byteLength), 'text-slate-500');
       } else {
@@ -618,8 +619,8 @@
         logWS('↓ closed ' + evt.code, 'text-slate-600');
       }
       clearInterval(sendInterval);
-      if (_player) { _player = null; }
-      _activeWS = null;
+      if (_player === localPlayer) { _player = null; }
+      if (_activeWS === ws) { _activeWS = null; }
     };
   }
 
