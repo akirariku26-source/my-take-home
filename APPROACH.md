@@ -347,6 +347,16 @@ This is handled via a `threading.Event` cancellation signal threaded through the
 
 **Result:** On client disconnect, the worker thread stops after completing at most the *current sentence* (~0.3-0.5s) instead of the entire remaining text (potentially 10-30s). The thread is immediately available for the next waiting client. The `queue.put()` timeout was also reduced from 60s to 10s with graceful error handling, so even if the event loop is gone the thread unblocks quickly.
 
+### Why the inference server stays in Python
+
+Rewriting `tts-inference` in Go or Rust is occasionally suggested for "true threads" and GIL avoidance. In practice it would not move the needle here:
+
+- **The GIL is already not the bottleneck.** PyTorch releases the GIL during all C++ inference operations (matrix multiplications, attention, vocoder). Multiple `ThreadPoolExecutor` workers already run genuine parallel inference today.
+- **Server overhead is noise.** At 1–13s per synthesis call, Python gRPC adds microseconds of overhead — well below measurement error.
+- **The model is Python-native.** Kokoro is a PyTorch model. Using it from Go or Rust requires LibTorch C++ bindings plus a port of the KPipeline phonemizer and vocoder logic — significant work to recover milliseconds.
+
+The calculus changes only if the model runtime itself is replaced with a non-Python engine (ONNX Runtime, TensorRT, GGUF/llama.cpp-style). In that case, writing the gRPC server alongside the runtime in C++ or Rust makes sense — but that is a model decision, not a server language decision. The gRPC interface is already the isolation boundary that would make such a swap possible without touching any other service.
+
 ### Horizontal scaling
 
 The service is stateless by design. Scaling out:

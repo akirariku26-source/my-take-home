@@ -184,8 +184,10 @@ class TTSUser(HttpUser):
             stream=True,
             catch_response=True,
         ) as resp:
-            # Consume the stream so Locust measures full transfer time
-            if resp.raw is not None:
+            if resp.status_code != 200:
+                resp.failure(f"Expected 200, got {resp.status_code}")
+            elif resp.raw is not None:
+                # Consume the stream so Locust measures full transfer time
                 for _ in resp.iter_content(chunk_size=4096):
                     pass
 
