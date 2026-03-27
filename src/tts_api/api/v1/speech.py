@@ -248,28 +248,46 @@ def _stream_response(
                 yield make_streaming_wav_header(tts.sample_rate)
 
             byte_count = 0
-            first_chunk = True
+            first_chunk_ms: float | None = None
             start = time.perf_counter()
+            logger.info("stream_start", voice=voice, text_length=len(text))
             try:
                 async for pcm_chunk in tts.synthesize_streaming(text, voice, speed):
-                    if first_chunk:
-                        _STREAM_FIRST_CHUNK.labels(voice=voice).observe(
-                            time.perf_counter() - start
+                    if first_chunk_ms is None:
+                        first_chunk_ms = (time.perf_counter() - start) * 1000
+                        _STREAM_FIRST_CHUNK.labels(voice=voice).observe(first_chunk_ms / 1000)
+                        logger.info(
+                            "stream_first_chunk",
+                            voice=voice,
+                            first_chunk_ms=round(first_chunk_ms, 1),
                         )
-                        first_chunk = False
                     yield pcm_chunk
                     byte_count += len(pcm_chunk)
             except Exception as exc:
-                logger.error("stream_error", voice=voice, error=str(exc))
+                logger.error(
+                    "stream_error",
+                    voice=voice,
+                    text_length=len(text),
+                    first_chunk_ms=round(first_chunk_ms, 1) if first_chunk_ms is not None else None,
+                    error=str(exc),
+                )
                 _REQUESTS.labels(
                     voice=voice, format=f"{fmt.value}-stream", status="error"
                 ).inc()
                 raise
 
-            _STREAM_DURATION.labels(voice=voice).observe(time.perf_counter() - start)
+            total_ms = (time.perf_counter() - start) * 1000
+            _STREAM_DURATION.labels(voice=voice).observe(total_ms / 1000)
             _BYTES_OUT.inc(byte_count)
             _REQUESTS.labels(voice=voice, format=f"{fmt.value}-stream", status="ok").inc()
-            logger.info("stream_complete", voice=voice, bytes=byte_count)
+            logger.info(
+                "stream_complete",
+                voice=voice,
+                text_length=len(text),
+                first_chunk_ms=round(first_chunk_ms, 1) if first_chunk_ms is not None else None,
+                total_ms=round(total_ms, 1),
+                bytes_out=byte_count,
+            )
 
     media_type = "audio/wav" if fmt == AudioFormat.wav else "audio/pcm"
     headers = {

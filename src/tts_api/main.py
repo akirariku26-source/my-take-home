@@ -45,19 +45,17 @@ async def lifespan(app: FastAPI):
     # ── TTS services ──────────────────────────────────────────────────────────
     services = await create_service_bundle(settings)
 
+    # Pre-warm the model so the first user request pays no cold-start cost.
+    # KokoroTTSService.warmup() loads KPipeline on every worker thread (~3-5 s).
+    # Remote backends (gRPC, Celery) have a no-op warmup — their inference
+    # server handles its own warm-up independently.
     logger.info("warming_up_tts_model")
-    buffered_ready = await services.buffered.health_check()
-    if buffered_ready:
-        logger.info("tts_service_ready", role="buffered")
-    else:
-        logger.warning("tts_service_not_ready", role="buffered", note="Will retry on first request")
+    await services.buffered.warmup()
+    logger.info("tts_service_ready", role="buffered")
 
     if services.streaming is not services.buffered:
-        streaming_ready = await services.streaming.health_check()
-        if streaming_ready:
-            logger.info("tts_service_ready", role="streaming")
-        else:
-            logger.warning("tts_service_not_ready", role="streaming")
+        await services.streaming.warmup()
+        logger.info("tts_service_ready", role="streaming")
 
     # ── Audio cache ───────────────────────────────────────────────────────────
     audio_cache = AudioCache(

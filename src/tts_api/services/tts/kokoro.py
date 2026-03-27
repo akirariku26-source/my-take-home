@@ -47,6 +47,7 @@ class KokoroTTSService(TTSServiceBase):
 
     def __init__(self, lang_code: str = "a", max_workers: int = 4) -> None:
         self._lang_code = lang_code
+        self._max_workers = max_workers
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="tts-worker"
         )
@@ -157,6 +158,22 @@ class KokoroTTSService(TTSServiceBase):
         from tts_api.services.tts.base import DEFAULT_VOICES
 
         return list(DEFAULT_VOICES)
+
+    async def warmup(self) -> None:
+        """Pre-load the Kokoro pipeline on every worker thread.
+
+        Submits a _pipeline() call to each thread in the pool so that by the
+        time the first real request arrives all threads have a loaded KPipeline
+        and the cold-start cost (~3-5 s on first call) is paid at startup
+        rather than on the first user request.
+        """
+        loop = asyncio.get_running_loop()
+        logger.info("warming_up_kokoro_model", workers=self._max_workers)
+        await asyncio.gather(*(
+            loop.run_in_executor(self._executor, self._pipeline)
+            for _ in range(self._max_workers)
+        ))
+        logger.info("kokoro_model_warm", workers=self._max_workers)
 
     async def health_check(self) -> bool:
         """Return True once any worker thread has successfully loaded the model.

@@ -129,5 +129,13 @@ class TTSServiceBase(ABC):
         """Return True if the backend is ready to accept requests."""
         ...
 
+    async def warmup(self) -> None:  # noqa: B027 — intentional no-op default
+        """Pre-warm the backend so the first request pays no cold-start cost.
+
+        Override in subclasses that have lazy initialization (e.g. loading a
+        model on the first worker thread).  The default is a no-op so remote
+        backends (gRPC, Celery) work without changes.
+        """
+
     async def shutdown(self) -> None:  # noqa: B027 — intentional no-op default
         """Release resources (thread pools, etc.).  Override if needed."""
