@@ -120,6 +120,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             RateLimitMiddleware,
             rpm=settings.rate_limit_rpm,
             burst=settings.rate_limit_burst,
+            trust_proxy=settings.rate_limit_trust_proxy,
+            max_clients=settings.rate_limit_max_clients,
         )
 
     # MetricsMiddleware must be added last so it becomes the outermost wrapper

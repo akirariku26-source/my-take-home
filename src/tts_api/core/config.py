@@ -81,6 +81,12 @@ class Settings(BaseSettings):
     rate_limit_enabled: bool = True
     rate_limit_rpm: int = 60    # sustained requests/minute per client
     rate_limit_burst: int = 10  # burst capacity (tokens)
+    # Only honour X-Forwarded-For when the service sits behind a trusted reverse
+    # proxy that overwrites the header.  Leave False for direct exposure.
+    rate_limit_trust_proxy: bool = False
+    # Maximum number of distinct client IDs tracked in-memory.  Oldest-seen
+    # entries are evicted when the limit is reached (LRU semantics).
+    rate_limit_max_clients: int = 10_000
 
     # ── Authentication ────────────────────────────────────────────────────────
     # Comma-separated list of valid API keys.

@@ -77,7 +77,7 @@ class GrpcTTSService(TTSServiceBase):
         try:
             async for chunk in self._stub.SynthesizeStream(
                 tts_pb2.SynthesizeRequest(text=text, voice=voice, speed=speed),
-                timeout=30,
+                timeout=120,
             ):
                 if _cancel.is_set():
                     return

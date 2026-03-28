@@ -82,6 +82,25 @@ class TestStreamingHTTP:
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 
 
+def _make_ws_app(max_text_length: int):
+    """Create a test app with a custom max_text_length for limit tests."""
+    from tts_api.core.config import Settings
+    from tts_api.main import create_app
+    from tts_api.services.cache import AudioCache
+    from tts_api.services.concurrency import AdaptiveConcurrencyLimiter
+    from tts_api.services.tts.factory import ServiceBundle, create_tts_service
+
+    s = Settings(backend="mock", max_text_length=max_text_length, rate_limit_enabled=False)
+    application = create_app(s)
+    svc = create_tts_service(s)
+    application.state.services = ServiceBundle(buffered=svc, streaming=svc)
+    application.state.audio_cache = AudioCache(max_size=100, ttl_seconds=60, enabled=False)
+    application.state.concurrency_limiter = AdaptiveConcurrencyLimiter(
+        initial=4, enabled=False
+    )
+    return application
+
+
 class TestWebSocket:
     async def test_ws_accepts_connection(self, app):
         from starlette.testclient import TestClient
@@ -156,6 +175,119 @@ class TestWebSocket:
                 ws.send_json({"type": "bogus"})
                 resp = ws.receive_json()
                 assert resp["type"] == "error"
+
+    def test_ws_per_message_limit_returns_error_keeps_session(self):
+        """A single oversized frame returns an error frame; session stays open."""
+        from starlette.testclient import TestClient
+
+        app = _make_ws_app(max_text_length=20)
+        with TestClient(app) as tc:
+            with tc.websocket_connect("/v1/audio/speech/ws") as ws:
+                ws.receive_json()  # ready
+                ws.send_json({"type": "text", "text": "x" * 21})  # one char over
+                err = ws.receive_json()
+                assert err["type"] == "error"
+                assert "21" in err["message"] and "20" in err["message"]
+                # Session is still live: a normal message works afterwards
+                ws.send_json({"type": "text", "text": "Hi."})
+                ws.send_json({"type": "flush"})
+                frames = []
+                while True:
+                    raw = ws.receive()
+                    if raw.get("bytes"):
+                        frames.append(raw["bytes"])
+                    elif raw.get("text"):
+                        msg = json.loads(raw["text"])
+                        if msg["type"] == "done":
+                            break
+                        if msg["type"] == "error":
+                            pytest.fail(f"Unexpected error after recovery: {msg}")
+                assert len(frames) > 0, "Expected audio after recovering from limit error"
+
+    def test_ws_per_turn_limit_returns_error_keeps_session(self):
+        """Accumulated text exceeding the per-turn limit returns an error frame."""
+        from starlette.testclient import TestClient
+
+        app = _make_ws_app(max_text_length=30)
+        with TestClient(app) as tc:
+            with tc.websocket_connect("/v1/audio/speech/ws") as ws:
+                ws.receive_json()  # ready
+                # 23 chars, no sentence boundary — stays in accumulator buffer
+                ws.send_json({"type": "text", "text": "Hello world and friends"})
+                # 12 more chars → total 35 > 30 → error frame expected
+                ws.send_json({"type": "text", "text": " greet them all"})
+                # Drain frames (possible audio from first message if a boundary fired)
+                # until we find the error JSON; fail if we hit "done" first.
+                err = None
+                for _ in range(20):
+                    raw = ws.receive()
+                    if raw.get("text"):
+                        msg = json.loads(raw["text"])
+                        if msg["type"] == "error":
+                            err = msg
+                            break
+                        if msg["type"] == "done":
+                            pytest.fail("Received 'done' before expected error frame")
+                assert err is not None, "Expected error frame for per-turn limit"
+                assert "too long" in err["message"].lower()
+
+    def test_ws_turn_counter_resets_after_flush(self):
+        """After a flush the per-turn counter resets; the next turn gets a fresh budget."""
+        from starlette.testclient import TestClient
+
+        app = _make_ws_app(max_text_length=30)
+        with TestClient(app) as tc:
+            with tc.websocket_connect("/v1/audio/speech/ws") as ws:
+                ws.receive_json()  # ready
+
+                # Turn 1: send 25 chars, flush
+                ws.send_json({"type": "text", "text": "Hello world, how are you?"})  # 25 chars
+                ws.send_json({"type": "flush"})
+                while True:
+                    raw = ws.receive()
+                    if raw.get("text") and json.loads(raw["text"])["type"] == "done":
+                        break
+
+                # Turn 2: another 25 chars — should succeed (counter was reset)
+                ws.send_json({"type": "text", "text": "Hello world, how are you?"})  # 25 chars
+                ws.send_json({"type": "flush"})
+                frames = []
+                while True:
+                    raw = ws.receive()
+                    if raw.get("bytes"):
+                        frames.append(raw["bytes"])
+                    elif raw.get("text"):
+                        msg = json.loads(raw["text"])
+                        if msg["type"] == "done":
+                            break
+                        if msg["type"] == "error":
+                            pytest.fail(f"Turn 2 should not hit limit: {msg}")
+                assert len(frames) > 0, "Expected audio in turn 2 after counter reset"
+
+    def test_ws_normal_flow_no_text_loss(self):
+        """Multiple text messages within limits produce audio without loss or duplication."""
+        from starlette.testclient import TestClient
+
+        # Large enough limit so everything fits
+        app = _make_ws_app(max_text_length=10_000)
+        with TestClient(app) as tc:
+            with tc.websocket_connect("/v1/audio/speech/ws") as ws:
+                ws.receive_json()  # ready
+                ws.send_json({"type": "text", "text": "First sentence. "})
+                ws.send_json({"type": "text", "text": "Second sentence. "})
+                ws.send_json({"type": "flush"})
+                frames = []
+                while True:
+                    raw = ws.receive()
+                    if raw.get("bytes"):
+                        frames.append(raw["bytes"])
+                    elif raw.get("text"):
+                        msg = json.loads(raw["text"])
+                        if msg["type"] == "done":
+                            break
+                        if msg["type"] == "error":
+                            pytest.fail(f"Unexpected WS error: {msg}")
+                assert len(frames) > 0
 
 
 # ── Sentence accumulator unit tests ──────────────────────────────────────────

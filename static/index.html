@@ -65,22 +65,14 @@
       </div>
 
       <!-- controls row -->
-      <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <div class="grid grid-cols-3 gap-3">
         <!-- voice -->
-        <div class="col-span-2 sm:col-span-1">
+        <div class="col-span-1">
           <label class="text-xs text-slate-400 block mb-1">Voice</label>
           <select id="voice-select"
             class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-sm focus:outline-none focus:border-indigo-500 transition-colors">
             <option value="af_heart">Loading…</option>
           </select>
-        </div>
-        <!-- speed -->
-        <div class="col-span-2 sm:col-span-1">
-          <label class="text-xs text-slate-400 block mb-1">
-            Speed&nbsp;<span id="speed-label" class="text-slate-200 tabular-nums">1.0×</span>
-          </label>
-          <input type="range" id="speed-range" min="0.5" max="2.0" step="0.1" value="1.0"
-            class="w-full h-2 accent-indigo-500 cursor-pointer mt-1.5" />
         </div>
         <!-- api key -->
         <div class="col-span-2">
@@ -367,9 +359,11 @@
     ta.addEventListener('input', updateCount);
     updateCount();
 
-    // speed slider
-    el('speed-range').addEventListener('input', e => {
-      el('speed-label').textContent = parseFloat(e.target.value).toFixed(1) + '×';
+    // voice selector — live config push for active WebSocket sessions
+    el('voice-select').addEventListener('change', e => {
+      if (_activeWS && _activeWS.readyState === WebSocket.OPEN) {
+        _activeWS.send(JSON.stringify({ type: 'config', voice: e.target.value }));
+      }
     });
 
     // health check
@@ -412,7 +406,6 @@
     const body = {
       input:           el('input-text').value,
       voice:           el('voice-select').value,
-      speed:           parseFloat(el('speed-range').value),
       response_format: 'wav',
       stream:          false,
     };
@@ -464,7 +457,6 @@
     const body = {
       input:           el('input-text').value,
       voice:           el('voice-select').value,
-      speed:           parseFloat(el('speed-range').value),
       response_format: 'pcm',
       stream:          true,
     };
@@ -577,11 +569,10 @@
         const msg = JSON.parse(evt.data);
         if (msg.type === 'ready') {
           logWS('← ready · ' + JSON.stringify({ sr: msg.sample_rate, ch: msg.channels }), 'text-emerald-600');
-          // set voice/speed from controls
+          // set voice from controls
           ws.send(JSON.stringify({
             type:  'config',
             voice: el('voice-select').value,
-            speed: parseFloat(el('speed-range').value),
           }));
           logWS('→ config · voice=' + el('voice-select').value, 'text-indigo-400');
           // start streaming words (simulating LLM output ~5 words/sec)

@@ -446,6 +446,9 @@ async def websocket_speech(
     _MAX_CONCURRENT_SENTENCES = 3
     _dispatch_sem = asyncio.Semaphore(_MAX_CONCURRENT_SENTENCES)
 
+    # Set to True once a JSON error frame has been sent so we never send two.
+    _session_error_sent = False
+
     async def _dispatch(chunk_q: asyncio.Queue, text: str, _voice: str, _speed: float) -> None:
         """Background task: stream synthesis chunks into chunk_q in order."""
         async with _dispatch_sem:
@@ -458,7 +461,10 @@ async def websocket_speech(
                         first = False
                     await chunk_q.put(pcm)
             except Exception as exc:
-                await chunk_q.put(exc)
+                # Don't enqueue after cancellation — client is gone, _sender is
+                # already exiting, and we'd only trigger a stale error frame.
+                if not cancel.is_set():
+                    await chunk_q.put(exc)
             finally:
                 await chunk_q.put(None)  # always signal end-of-sentence
 
@@ -472,6 +478,7 @@ async def websocket_speech(
 
     async def _sender() -> None:
         """Drain sentence_pipe in order; send audio chunks to the client."""
+        nonlocal _session_error_sent
         while True:
             item = await sentence_pipe.get()
             if item is _PIPE_STOP:
@@ -489,6 +496,17 @@ async def websocket_speech(
                 if chunk is None:
                     break
                 if isinstance(chunk, Exception):
+                    # Send a structured error frame so the client can distinguish
+                    # a TTS synthesis failure from a generic network disconnect,
+                    # then re-raise to tear down the session with close code 1011.
+                    if not _session_error_sent:
+                        try:
+                            await websocket.send_json(
+                                {"type": "error", "message": str(chunk)}
+                            )
+                            _session_error_sent = True
+                        except Exception:
+                            pass
                     raise chunk
                 try:
                     await websocket.send_bytes(chunk)
@@ -497,6 +515,9 @@ async def websocket_speech(
 
     async def _receiver() -> None:
         nonlocal voice, speed
+        # Running total of chars pushed to the accumulator in the current turn.
+        # Resets to 0 on every flush so each turn is budgeted independently.
+        _turn_chars = 0
         try:
             while True:
                 message = await websocket.receive()
@@ -519,12 +540,35 @@ async def websocket_speech(
                     voice = data.get("voice", voice)
                     speed = float(data.get("speed", speed))
                 elif msg_type == "text":
-                    for sentence in accumulator.push(data.get("text", "")):
+                    text = data.get("text", "")
+                    limit = settings.max_text_length
+                    # Per-message guard: a single frame already exceeds the limit.
+                    if len(text) > limit:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": (
+                                f"Message text too long: {len(text)} chars (max {limit})"
+                            ),
+                        })
+                        continue
+                    # Per-turn guard: cumulative text for this turn would exceed the limit.
+                    if _turn_chars + len(text) > limit:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": (
+                                f"Turn text too long: {_turn_chars + len(text)} total chars"
+                                f" (max {limit})"
+                            ),
+                        })
+                        continue
+                    _turn_chars += len(text)
+                    for sentence in accumulator.push(text):
                         _enqueue_sentence(sentence)
                 elif msg_type == "flush":
                     for sentence in accumulator.flush():
                         _enqueue_sentence(sentence)
                     sentence_pipe.put_nowait(_PIPE_FLUSH)
+                    _turn_chars = 0  # budget resets for the next turn
                 else:
                     await websocket.send_json(
                         {"type": "error", "message": f"Unknown message type: {msg_type!r}"}
@@ -546,6 +590,14 @@ async def websocket_speech(
         exc = eg.exceptions[0]
         logger.error("websocket_error", error=str(exc))
         _WS_ERRORS.labels(error_type=classify_error(exc)).inc()
+        # If _sender already sent an error frame (synthesis failure), don't send
+        # a second one.  For unexpected session-level exceptions that bypassed
+        # _sender, send a generic frame so the client knows it was a server fault.
+        if not _session_error_sent:
+            try:
+                await websocket.send_json({"type": "error", "message": "Internal server error"})
+            except Exception:
+                pass
         try:
             await websocket.close(code=1011)
         except Exception:
