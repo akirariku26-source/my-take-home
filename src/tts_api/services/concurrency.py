@@ -60,6 +60,31 @@ _EWMA_LATENCY = Gauge(
 )
 
 
+class _AcquireToken:
+    """Yielded by AdaptiveConcurrencyLimiter.acquire().
+
+    Callers that can separate synthesis time from network-delivery time should
+    call set_elapsed() once synthesis is complete so that slow-client
+    back-pressure does not inflate the EWMA and unfairly shrink the window.
+
+    If set_elapsed() is never called the full wall-clock time is used (the
+    original behaviour, and correct for non-streaming callers).
+    """
+
+    __slots__ = ("elapsed",)
+
+    def __init__(self) -> None:
+        self.elapsed: float | None = None
+
+    def set_elapsed(self, elapsed: float) -> None:
+        """Override the latency sample reported to the AIMD algorithm.
+
+        Call this after synthesis finishes but before the slot is released —
+        i.e. before the ``async with limiter.acquire()`` block exits.
+        """
+        self.elapsed = elapsed
+
+
 class AdaptiveConcurrencyLimiter:
     """
     AIMD-based adaptive concurrency limiter.
@@ -123,7 +148,7 @@ class AdaptiveConcurrencyLimiter:
         Updates the EWMA and adjusts the window on exit.
         """
         if not self._enabled:
-            yield
+            yield _AcquireToken()
             return
 
         async with self._lock:
@@ -142,11 +167,14 @@ class AdaptiveConcurrencyLimiter:
             self._in_flight += 1
             _IN_FLIGHT.set(self._in_flight)
 
+        token = _AcquireToken()
         start = time.perf_counter()
         try:
-            yield
+            yield token
         finally:
-            elapsed = time.perf_counter() - start
+            # Use caller-supplied synthesis time if available; fall back to
+            # full wall-clock elapsed so non-streaming callers need no changes.
+            elapsed = token.elapsed if token.elapsed is not None else time.perf_counter() - start
             async with self._lock:
                 self._in_flight -= 1
                 _IN_FLIGHT.set(self._in_flight)

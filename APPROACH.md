@@ -390,3 +390,51 @@ A Locust load test (`make loadtest`) profiles this precisely for a given pod spe
 7. **Inference auto-scaling** — expose `tts_concurrency_in_flight` from the inference server and drive K8s HPA on it, scaling inference replicas independently from the API tier.
 
 8. **Production deployment** — `docker-compose.yml` and both Dockerfiles are ready. Add: a reverse proxy for TLS termination, a Prometheus + Grafana stack for dashboards, and auto-scaling rules for each tier.
+
+---
+
+## Post-Submission Improvements
+
+### Cold-Start Latency Fix
+`KokoroTTSService` lazy-initialises `KPipeline` per thread. The original lifespan warmup called `health_check()` (a no-op), leaving a 4–5 s cold-start cost on the first real request. Added `warmup()` to `TTSServiceBase` (default no-op so remote backends inherit it for free) and overrode it in `KokoroTTSService` to concurrently submit `_pipeline()` to all worker threads via `asyncio.gather + run_in_executor`. The lifespan now calls `warmup()` for both `buffered` and `streaming` service slots.
+
+### gRPC Streaming Timeout Alignment
+`_synthesize` (unary) used `timeout=120` but `synthesize_streaming` used `timeout=30`. Because `timeout=` on a gRPC streaming RPC is a total wall-clock deadline for the entire stream — not a per-chunk idle timeout — long texts could time out mid-stream on the streaming path while succeeding on the unary path. Aligned both to `timeout=120`.
+
+### WebSocket Structured Error Frames
+Synthesis errors previously closed the WebSocket with code 1011 but sent no JSON frame. Clients could not distinguish a TTS failure from a network drop. Added `{"type":"error","message":"..."}` frames before close:
+- `_session_error_sent` flag prevents duplicate frames.
+- `_dispatch` catches synthesis exceptions and puts them in `chunk_q` as `RuntimeError` / `HTTPException`.
+- `_sender` detects exception objects, sends the error frame, then re-raises to trigger the 1011 close.
+- The outer `except*` block sends a generic frame if one was not already sent.
+
+### Rate Limiter Hardening
+Two weaknesses in the original token-bucket middleware: (1) it trusted `X-Forwarded-For` unconditionally (spoofable — any client could choose its own rate-limit identity), and (2) it stored per-client state in an unbounded `dict` (random IPs could exhaust memory). Fixes:
+- Added `trust_proxy: bool = False` setting. `X-Forwarded-For` is only used when explicitly enabled; default falls back to the real peer IP.
+- Replaced `dict` with `OrderedDict` used as an LRU map bounded by `max_clients=10_000` (~5 MB worst case). Evicted clients get a fresh full bucket — semantically correct and a soft incentive to not cycle IPs.
+- Token-bucket semantics (`rpm`, `burst`, `Retry-After`) are preserved exactly.
+
+### WebSocket Per-Message / Per-Turn Text Limits
+HTTP requests were bounded by `max_text_length`; WebSocket messages had no equivalent guard. Added `_turn_chars` counter in `_receiver`:
+- **Per-message:** `len(text) > max_text_length` → error frame, skip message, keep session alive.
+- **Per-turn:** `_turn_chars + len(text) > max_text_length` → same.
+- `_turn_chars` resets to `0` on every `flush`, so each turn gets an independent budget.
+- 4 new integration tests cover: per-message violation, per-turn violation, counter reset after flush, and normal multi-message flow with no text loss.
+
+### Speed Slider Removal
+Removed the speed control from the dev console UI entirely — the speed parameter was unreliable across inputs. Also added a live voice `config` push so changing the voice selector updates an active WebSocket session without requiring a reconnect.
+
+### Adaptive Concurrency — WebSocket Burst Protection
+The HTTP path used `limiter.acquire()` per request; the WebSocket `_dispatch` coroutine bypassed it entirely. Each `_dispatch` now wraps its synthesis loop with `async with limiter.acquire()`. A 503 `HTTPException` from the limiter is caught and placed in `chunk_q` as `RuntimeError`, so `_sender` can forward a structured error frame to the client — consistent with how synthesis errors are surfaced.
+
+### Adaptive Concurrency — Slow-Client Back-Pressure Isolation
+For streaming HTTP, the `acquire()` slot was held from synthesis start until the last byte was delivered. Slow clients (poor networks) inflated the EWMA with delivery latency, causing the concurrency window to shrink even when the TTS backend was healthy.
+
+Added `_AcquireToken` with a `set_elapsed(float)` method. `acquire()` yields the token; `_stream_response._generate()` calls `slot.set_elapsed(time.perf_counter() - start)` after the synthesis loop finishes (before the generator exits). The AIMD algorithm uses this value instead of wall-clock time, so only synthesis latency drives the window. WebSocket needs no equivalent change — synthesis and delivery are already decoupled via `chunk_q`.
+
+### Adaptive Concurrency — Deterministic Unit Tests
+Added `tests/test_concurrency.py` with 18 tests split into two classes:
+
+**`TestAIMDAlgorithm` (9 synchronous tests)** — calls `_adjust()` directly with known latency values, asserts exact `_limit` / `_ewma` outcomes. Covers: EWMA bootstrap from first sample, exponential smoothing, multiplicative decrease on congestion, additive increase in healthy zone, hold zone, min/max clamps, and exact boundary conditions (`EWMA == target`, `EWMA == 0.8 × target`). No async machinery — tests run in ~1 ms.
+
+**`TestAcquireBehavior` (9 async tests)** — exercises `acquire()` end-to-end. Covers: in-flight increment and decrement, slot released on exception, 503 with `Retry-After` header when window is full, disabled-mode pass-through, `set_elapsed()` EWMA override, wall-clock fallback when `set_elapsed()` is not called, synthesis-vs-delivery isolation (verifies EWMA reflects synthesis time even when delivery takes longer), disabled-token `set_elapsed()` no-op, and three concurrent slots each tracking independently.

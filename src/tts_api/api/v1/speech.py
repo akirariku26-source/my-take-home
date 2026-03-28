@@ -242,7 +242,7 @@ def _stream_response(
         # If the window is full, HTTPException(503) propagates cleanly here
         # because no bytes have been sent yet — Starlette can still return a
         # proper error response.  Once we start yielding, headers are committed.
-        async with limiter.acquire():
+        async with limiter.acquire() as slot:
             if fmt == AudioFormat.wav:
                 # WAV header with unknown data size — players treat it as "play until EOF"
                 yield make_streaming_wav_header(tts.sample_rate)
@@ -264,6 +264,9 @@ def _stream_response(
                     yield pcm_chunk
                     byte_count += len(pcm_chunk)
             except Exception as exc:
+                # Record synthesis time before re-raising so the AIMD window
+                # reflects inference cost, not client-receive time.
+                slot.set_elapsed(time.perf_counter() - start)
                 logger.error(
                     "stream_error",
                     voice=voice,
@@ -275,6 +278,11 @@ def _stream_response(
                     voice=voice, format=f"{fmt.value}-stream", status="error"
                 ).inc()
                 raise
+
+            # Synthesis complete — pin the elapsed time now, before the remaining
+            # chunks are flushed to the client.  Prevents slow-client back-pressure
+            # from inflating the EWMA and unfairly shrinking the concurrency window.
+            slot.set_elapsed(time.perf_counter() - start)
 
             total_ms = (time.perf_counter() - start) * 1000
             _STREAM_DURATION.labels(voice=voice).observe(total_ms / 1000)
@@ -407,6 +415,7 @@ async def websocket_speech(
     """
     settings = websocket.app.state.settings
     tts = websocket.app.state.services.streaming
+    limiter = websocket.app.state.concurrency_limiter
 
     # Auth check before accepting — reject at the handshake level
     if not check_ws_api_key(api_key, settings):
@@ -455,11 +464,20 @@ async def websocket_speech(
             start = time.perf_counter()
             first = True
             try:
-                async for pcm in tts.synthesize_streaming(text, _voice, _speed, cancel=cancel):
-                    if first:
-                        _WS_FIRST_CHUNK.labels(voice=_voice).observe(time.perf_counter() - start)
-                        first = False
-                    await chunk_q.put(pcm)
+                # Use the global limiter so WS sentences count against the same
+                # AIMD window as HTTP requests.  A 503 is converted to a plain
+                # RuntimeError so _sender can forward it as a JSON error frame.
+                async with limiter.acquire():
+                    async for pcm in tts.synthesize_streaming(text, _voice, _speed, cancel=cancel):
+                        if first:
+                            _WS_FIRST_CHUNK.labels(voice=_voice).observe(time.perf_counter() - start)
+                            first = False
+                        await chunk_q.put(pcm)
+            except HTTPException as exc:
+                # Capacity-full (503): convert to a plain error for _sender.
+                # Don't enqueue after cancellation — client is already gone.
+                if not cancel.is_set():
+                    await chunk_q.put(RuntimeError(exc.detail))
             except Exception as exc:
                 # Don't enqueue after cancellation — client is gone, _sender is
                 # already exiting, and we'd only trigger a stale error frame.
